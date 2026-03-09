@@ -1,0 +1,16 @@
+# 环境与密钥（切勿提交）
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# 本地/临时
+*.log
+.DS_Store
