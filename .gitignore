@@ -14,3 +14,10 @@ venv/
 # 本地/临时
 *.log
 .DS_Store
+
+# 大数据文件（不提交）
+data/
+results/
+
+# JSON 实验结果（不提交）
+*.json
