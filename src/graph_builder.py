@@ -80,6 +80,7 @@ def build_graph(
                 "file_path": fp,
                 "start_line": f["start_line"],
                 "end_line": f.get("end_line", f["start_line"]),
+                "parent_class": f.get("parent_class"),  # Python class methods
             })
         file_to_functions[fp] = list(range(base, len(functions)))
         base_c = len(classes)
@@ -151,7 +152,8 @@ def build_graph(
         "CONTAINS": [],
         "CALLS": [],
         "REFERENCES_VAR": [],
-        "HAS_MEMBER": [],  # Class -> Attribute
+        "HAS_MEMBER": [],  # Class -> Attribute (class member variables)
+        "HAS_METHOD": [],  # Class -> Function (Python class methods)
     }
 
     repo_id = "repo:1"
@@ -196,6 +198,17 @@ def build_graph(
 
     for f in functions:
         edges["CONTAINS"].append((f["file_path"], f["id"], {}))
+        # Python: 如果函数有 parent_class，创建 HAS_METHOD 边
+        parent_class = f.get("parent_class")
+        if parent_class:
+            # 找到对应的类节点 id
+            class_id = None
+            for c in classes:
+                if c["name"] == parent_class and c["file_path"] == f["file_path"]:
+                    class_id = c["id"]
+                    break
+            if class_id:
+                edges["HAS_METHOD"].append((class_id, f["id"], {}))
     for c in classes:
         edges["CONTAINS"].append((c["file_path"], c["id"], {}))
     for v in variables_by_id.values():
