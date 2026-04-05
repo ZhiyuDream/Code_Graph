@@ -497,25 +497,28 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
 _RAG_INDEX = None
 
 
-def _load_rag_index():
-    global _RAG_INDEX
-    if _RAG_INDEX is not None:
-        return _RAG_INDEX
-    idx_path = _ROOT / "data" / "classic_rag_index.json"
+def _load_rag_index(idx_name: str | None = None):
+    """加载 RAG 索引。idx_name 为 None 时使用环境变量 RAG_INDEX_NAME 或默认 classic_rag_index.json"""
+    if idx_name is None:
+        import os
+        idx_name = os.environ.get("RAG_INDEX_NAME", "classic_rag_index.json")
+    idx_path = _ROOT / "data" / idx_name
     if idx_path.exists():
         with open(idx_path, encoding="utf-8") as f:
-            _RAG_INDEX = json.load(f)
-    return _RAG_INDEX
+            return json.load(f)
+    return None
 
 
 def tool_search_by_embedding(driver, query: str, limit: int = 6) -> str:
     """
     基于 embedding 的语义搜索。
-    利用预计算的 RAG 索引（7695 chunks），通过 cosine 相似度找到语义最相关的函数。
+    利用预计算的 RAG 索引，通过 cosine 相似度找到语义最相关的函数。
     返回每个函数的名称、文件、描述 annotation。
 
     当 graph 查询（CONTAINS 匹配）失败时，用这个工具作为 fallback——
     它通过语义相似性而非字符串匹配来找到相关函数。
+
+    使用环境变量 RAG_INDEX_NAME 指定索引文件（默认 classic_rag_index.json）。
     """
     idx = _load_rag_index()
     if idx is None:

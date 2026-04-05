@@ -46,12 +46,13 @@ def cmd_clone(args):
         return
 
     # 解析 repos.txt，找到对应的 repo URL 和 commit
-    target_prefix = f"github.com/{repo_name}" if "/" not in repo_name else repo_name
+    # repo_name 可能是 "flask" (匹配 pallets/flask) 或 "owner/repo" (精确匹配)
     repo_url = None
     commit = None
     with open(repos_txt) as f:
         for line in f:
-            if target_prefix in line:
+            url = line.strip().split()[0]
+            if f"/{repo_name}" in url or url.endswith(f"/{repo_name}"):
                 parts = line.strip().split()
                 if len(parts) >= 2:
                     repo_url = parts[0]
@@ -62,6 +63,7 @@ def cmd_clone(args):
         print(f"ERROR: Could not find repo {repo_name} in repos.txt")
         return
 
+    # 简单命名：使用 repo_name 作为目录名
     clone_dir = _ROOT / "data" / "swe_repos" / repo_name
     if clone_dir.exists():
         print(f"Repo already cloned at {clone_dir}")
