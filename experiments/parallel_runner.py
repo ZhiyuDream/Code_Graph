@@ -128,8 +128,12 @@ RAG分数：[0到1之间的小数]
         ag_reason, rag_reason = content, content
 
         m = re.search(r'Graph-Agent[分数打分：:]\s*([0-9.]+)', content)
+        if not m:
+            m = re.search(r'Graph-Agent分数[：:\s]+([0-9.]+)', content)
         if m: ag_score = float(m.group(1))
         m = re.search(r'RAG[分数打分：:]\s*([0-9.]+)', content)
+        if not m:
+            m = re.search(r'RAG分数[：:\s]+([0-9.]+)', content)
         if m: rag_score = float(m.group(1))
 
         return {
@@ -159,16 +163,24 @@ def run_llm_judge(agent_results: list, rag_results: list, output_path: Path, mod
     all_indices = sorted(set(ag_by_idx.keys()) & set(rg_by_idx.keys()))
     print(f"共 {len(all_indices)} 题需要 Judge")
 
+    def clean_str(s):
+        """Convert to string, handling NaN and None"""
+        if s is None:
+            return ""
+        if isinstance(s, float):  # NaN
+            return ""
+        return str(s)[:500]  # Truncate to avoid too long
+
     args_list = []
     for idx in all_indices:
         ag = ag_by_idx[idx]
         rg = rg_by_idx[idx]
         args_list.append((
             idx,
-            ag.get("具体问题", ""),
-            ag.get("参考答案", ""),
-            ag.get("生成答案", ""),
-            rg.get("生成答案", ""),
+            clean_str(ag.get("具体问题", "")),
+            clean_str(ag.get("参考答案", "")),
+            clean_str(ag.get("生成答案", "")),
+            clean_str(rg.get("生成答案", "")),
             judge_model,
         ))
 

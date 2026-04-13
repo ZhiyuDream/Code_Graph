@@ -22,17 +22,16 @@
    当前服务器若未安装，见项目根目录 `项目编写历史.md` 中的安装说明。
 
 3. **图提取脚本的依赖**  
-   本目录下的调用图/代码图提取脚本计划基于 **Clang AST**（如 Python `libclang`）或 **clangd LSP** 之一实现，依赖 `compile_commands.json` 与对应运行时（见 README 或脚本内说明）。
+   本目录下的调用图/代码图提取脚本基于 **clangd LSP**（Language Server Protocol）实现，依赖 `compile_commands.json` 与 clangd 运行时。clangd 20+ 提供准确的跨文件调用解析能力。
 
 ## 目录与脚本（规划）
 
 - **阶段 1（已实现）**：  
-  - `run_stage1.py`：基于 **libclang** 批量解析，构建 Repository、Directory、File、Function、Class、**Variable** 及 CONTAINS、CALLS、**REFERENCES_VAR**（Function→Variable，含引用行号），写入 Neo4j。**Variable 与“变量在哪里用到”仅由本脚本产出**；clangd 版暂不采集变量。  
-  - `run_stage1_clangd.py`：基于 **clangd LSP**（documentSymbol + call hierarchy），与 IDE 行为一致，跨文件 CALLS 解析更好；需本机安装 clangd，首次运行可能较慢。**若结果中 CALLS=0**：`callHierarchy/outgoingCalls` 在 **clangd 20** 才加入（PR #77556，2024-11-26 合并进 main），**clangd 14～19 均不支持**；可升级到 clangd 20+ 或改用 `run_stage1.py`（libclang）获取调用边。  
-  均采用方案 B（有 File 与目录节点）。
+  - `run_stage1.py`：基于 **clangd LSP**（documentSymbol + call hierarchy），与 IDE 行为一致，跨文件 CALLS 解析准确；需本机安装 **clangd 20+**，首次运行可能较慢（llama.cpp 规模约数分钟）。  
+  - ~~`run_stage1_clangd.py`~~：（已合并到 `run_stage1.py`，不再单独维护）。  
+  采用方案 B（显式层级：Repository→Directory→File→Function/Class）。
 - **阶段 2（已实现）**：`run_stage2.py` 从 Neo4j 发现入口候选（图结构：无 CALLS 入边的 Function），沿 CALLS 展开得到调用子图，创建 Workflow 节点及 WORKFLOW_ENTRY、PART_OF_WORKFLOW 写入 Neo4j。入口不定死规则，后续可接入 agent。详见下方「使用说明（阶段 2）」与 `docs/STAGE2_实现与目录约定.md`。
 - **阶段 3（已实现）**：`run_stage3.py` 使用 `.env` 中的 **GITHUB_TOKEN** 调用 GitHub API，拉取仓库 Issue 与 Pull Request，写入 Neo4j（Issue、PullRequest 节点；PR 含 changed_paths；FIXES 边 PR→Issue）。查询「该 PR 涉及哪些函数」时用 Function.file_path 与 PR.changed_paths 匹配。详见下方「使用说明（阶段 3）」。
-- **依赖**：`requirements.txt`（neo4j、python-dotenv、libclang、requests）。若使用 conda，可创建环境后安装，见 `env.example.yml` 或下方使用说明。
 - **环境变量**（.env）：`NEO4J_*`；`REPO_ROOT`（仓库根目录）；可选 `COMPILE_COMMANDS_DIR`；阶段 3 需 `GITHUB_TOKEN`，可选 `GITHUB_REPO=owner/repo`（未设置时从 REPO_ROOT 的 git remote 推导）。
 
 ## 与整体 pipeline 的关系
@@ -67,18 +66,17 @@
    ```
    若系统缺少 libclang 动态库，可安装：`conda install -c conda-forge libclang` 或系统包（如 `libclang-14-dev`），并按需设置 `LIBCLANG_PATH`。
 
-4. **运行阶段 1**  
-   - **libclang 版**（默认，批量解析、不依赖 clangd 进程）：
-     ```bash
-     python run_stage1.py
-     ```
-   - **clangd 版**（通过 LSP documentSymbol + call hierarchy，与 IDE 一致，跨文件调用解析更好；首次可能较慢，llama.cpp 规模约数分钟到十几分钟）：
-     ```bash
-     python run_stage1_clangd.py
-     ```
-   两种方式都会清空 Neo4j 中现有代码图、写入新图并更新 `Repository.last_processed_commit`。
+4. **运行阶段 1**（需要 clangd 20+）
+   ```bash
+   python run_stage1.py
+   ```
+   首次运行会启动 clangd 守护进程并索引代码，可能需要数分钟（llama.cpp 规模）。
+   脚本会清空 Neo4j 中现有代码图、写入新图并更新 `Repository.last_processed_commit`。
 
-**clangd 版本与 CALLS**：LSP 的 `callHierarchy/outgoingCalls`（用于采集“谁调谁”）在 **clangd 20** 才实现（[PR #77556](https://github.com/llvm/llvm-project/pull/77556)，2024-11-26 合并）。**clangd 14～19 均无此能力**，跑 `run_stage1_clangd.py` 时 Function/Class 会有，但 CALLS 会一直是 0。若需用 clangd 采调用边，请安装 **clangd 20+**（如 [LLVM 官网](https://releases.llvm.org/) 或包管理器）；否则用 `run_stage1.py`（libclang）即可得到 CALLS。
+**注意**：跨文件调用解析需要 **clangd 20+**。若安装的是 clangd 14-19，CALLS 边将为空。
+可通过 `clangd --version` 检查版本。安装最新版：[LLVM 官网](https://releases.llvm.org/)。
+
+---
 
 ---
 

@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-import sys
-from pathlib import Path
-_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_ROOT / "src"))
-sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(_ROOT.parent))
 """
 阶段 1：代码图采集。
 从 compile_commands.json 解析 C/C++ 仓库，构建 Repository、Directory、File、Function、Class 及 CONTAINS、CALLS，
 写入 Neo4j，并更新 last_processed_commit。
 
+使用 clangd LSP（20+）进行解析，提供准确的跨文件调用关系。
+
 使用前请：
-  1. 在目标仓库（如 llama.cpp）下生成 compile_commands.json（例如 mkdir build && cd build && cmake ..）
-  2. 在 .env 中配置 REPO_ROOT（仓库根目录）和/或 COMPILE_COMMANDS_DIR（含 compile_commands.json 的目录，默认 REPO_ROOT/build）
-  3. 配置 NEO4J_* 等（见 .env）
+  1. 安装 clangd 20+（apt install clangd 或从 LLVM 官网下载）
+  2. 在目标仓库（如 llama.cpp）下生成 compile_commands.json（例如 mkdir build && cd build && cmake ..）
+  3. 在 .env 中配置 REPO_ROOT（仓库根目录）和/或 COMPILE_COMMANDS_DIR（含 compile_commands.json 的目录，默认 REPO_ROOT/build）
+  4. 配置 NEO4J_* 等（见 .env）
 
 可选：创建 conda 环境后安装依赖：
   conda create -n code_graph python=3.11
@@ -23,15 +20,16 @@ sys.path.insert(0, str(_ROOT.parent))
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 # 确保 Code_Graph 目录在 path 中
-_CODE_GRAPH = Path(__file__).resolve().parent
+_CODE_GRAPH = Path(__file__).resolve().parent.parent
 if str(_CODE_GRAPH) not in sys.path:
     sys.path.insert(0, str(_CODE_GRAPH))
 
 from config import get_compile_commands_path, get_repo_root
-from src.ast_parser import collect_all_tus
+from src.clangd_parser import collect_all_via_clangd
 from src.graph_builder import build_graph
 from src.neo4j_writer import (
     get_driver,
@@ -51,17 +49,23 @@ def main() -> int:
     repo_root = get_repo_root()
     repo_root_str = str(repo_root) if repo_root else ""
 
+    print("使用 clangd LSP 采集代码图（首次可能较慢，需等待 clangd 索引）。")
     print(f"compile_commands 目录: {build_dir}")
     print(f"仓库根: {repo_root_str or '(未设置 REPO_ROOT)'}")
-    print("正在解析所有编译单元…")
-    tu_results = collect_all_tus(build_dir, repo_root)
-    print(f"解析完成，共 {len(tu_results)} 个文件。")
+    
+    t0 = time.perf_counter()
+    tu_results, var_refs_global = collect_all_via_clangd(
+        build_dir, repo_root, delay_after_init=3.0, delay_between_files=0.03, collect_var_refs=True
+    )
+    elapsed = time.perf_counter() - t0
+    print(f"clangd 解析完成，共 {len(tu_results)} 个文件，耗时 {elapsed:.1f}s。")
+    
     if not tu_results:
         print("没有解析到任何文件，请检查 compile_commands.json 与仓库路径。")
         return 1
 
     print("构建图结构…")
-    graph = build_graph(tu_results, repo_root_str)
+    graph = build_graph(tu_results, repo_root_str, var_refs_global=var_refs_global)
     n = graph["nodes"]
     n_repo = len(n.get("Repository", []))
     n_dir = len(n.get("Directory", []))

@@ -1,0 +1,633 @@
+index,类别,子类,实体名称,问题,参考答案,Evidence
+0,Issue驱动,Bug排查,Issue #14280,我遇到了这个问题：Inconsistent Embedding Similarity between llama-server and LlamaCppEmbeddings fo。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在使用同一份 BGE-M3_FP16.gguf 模型时，发现通过 llama-server 的 /v1/embeddings 接口生成的向量与通过 LlamaCppEmbeddings（Python 绑定）生成的向量在相似度计算上存在明显差异，且 llama-server 端的相似度明显偏低，表明两者生成的嵌入向量不一致。
+
+2. **可能原因**  
+llama.cpp 的推理流程中，embedding 生成依赖于模型加载、tokenization、前向计算及后处理等环节。造成差异的可能原因包括：  
+- 模型加载参数或量化配置不一致（如是否启用 fp16、int8 等）  
+- tokenizer 版本或参数不统一，导致输入文本分词结果不同  
+- llama-server 与 Python 绑定的默认推理参数（如上下文窗口、batch size、embedding 层选取）存在差异  
+- llama-server 端的后处理逻辑（如归一化、截断）与 Python 绑定不一致  
+- 多线程或 GPU 设备调用时的同步问题导致结果不稳定
+
+3. **排查思路**  
+- 确认两端使用完全相同的模型文件和加载参数  
+- 对比 tokenizer 输出的 token 序列是否一致  
+- 逐步打印和比对中间向量（如 embedding 层输出）  
+- 检查 llama-server 配置文件及启动参数，确保与 Python 绑定一致  
+- 在单线程 CPU 环境下复现，排除并发和硬件差异  
+- 查看 llama-server 日志是否有异常或警告信息
+
+4. **已知结论**  
+该 Issue 尚未给出最终修复方案，但社区推测主要是 llama-server 与 Python 绑定在推理参数和后处理上的差异导致。建议临时使用 Python 绑定作为参考标准，等待后续版本统一接口行为和参数配置，或自行对比并调整 llama-server 配置以匹配 Python 端表现。",Issue #14280
+1,Issue驱动,Bug排查,Issue #18351,我遇到了这个问题：No full utilization of GPU during usage of Qwen3-Next on rocm / cuda。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在使用 Qwen3-Next-80B-A3B-Instruct-GGUF 模型时，发现 GPU 利用率仅达到 60%-70%，而 CPU 却接近满负荷（约 102%），导致整体推理性能未达到预期，TPS 约为 24，且上下文长度较大（约 25k token）。
+
+2. **可能原因**  
+llama.cpp 在 GPU 后端（ROCm/CUDA）执行时，理论上应充分利用 GPU 并行计算能力。出现 GPU 利用率不足，CPU 却高负载，通常表明存在以下可能：  
+- 数据传输瓶颈：CPU 与 GPU 之间频繁同步或数据拷贝，导致 GPU 等待；  
+- 计算任务分配不均：部分计算仍在 CPU 端执行，未充分 offload 到 GPU；  
+- GPU 资源调度不合理：如 kernel 启动频繁、内存访问不连续，影响吞吐；  
+- 模型或上下文大小导致内存碎片或调度效率降低；  
+- ROCm/CUDA 驱动或 llama.cpp 后端实现对 Qwen3-Next 特殊结构支持不完善。
+
+3. **排查思路**  
+- 使用 GPU 性能分析工具（如 ROCm Profiler、NVIDIA Nsight）观察 kernel 执行时间、内存带宽和同步等待；  
+- 检查 llama.cpp 日志，确认计算是否均已 offload 到 GPU，排查 CPU 端是否有瓶颈任务；  
+- 逐步缩小上下文长度，观察 GPU 利用率变化，判断是否因上下文过大导致调度效率下降；  
+- 对比不同后端（纯 CUDA、ROCm）及不同模型，确认是否为 Qwen3-Next 模型特有问题；  
+- 关注 llama.cpp 版本及后端实现更新，排查是否存在已知性能问题。
+
+4. **已知结论**  
+目前该 Issue 尚无明确修复方案，开发者建议重点排查数据传输与任务调度瓶颈，后续可能通过优化 GPU kernel 调度和减少 CPU-GPU 交互提升利用率。用户可关注后续 llama.cpp 更新，或尝试调整上下文大小和模型参数以缓解问题。",Issue #18351
+2,Issue驱动,性能问题,Issue #3422,llama.cpp 推理时遇到性能问题：[User] AMD GPU slower than CPU。有什么优化建议？,"针对“AMD GPU推理性能不及CPU”的问题，分析如下：
+
+1. **性能瓶颈**  
+当前 llama.cpp 在 AMD GPU 上的性能受限于 HIP 后端的计算调度和内存带宽利用效率。相比 CPU，GPU 端的内核启动开销、数据传输延迟以及 HIPBLAS 库对模型矩阵乘法的优化尚未达到最佳状态，导致实际推理速度不升反降。
+
+2. **影响范围**  
+该问题主要影响使用 AMD GPU（如 Radeon 7900XTX）且依赖 HIP 后端进行推理的用户，尤其是在运行中等及以上规模模型时更为明显。CPU（如 Intel 13900K）由于架构成熟且 llama.cpp 对 x86 SIMD 指令集有深度优化，表现反而更优。
+
+3. **优化方向**  
+- 优先使用 CPU 版本，特别是在当前 HIPBLAS 性能未充分提升前。  
+- 关注 HIPBLAS 和 ROCm 版本更新，等待底层库性能改进。  
+- 结合异构计算，尝试将部分计算任务放回 CPU。  
+- 未来可探索针对 AMD GPU 的专用内核优化和内存访问模式调整。  
+- 调整 batch size、线程数等参数，尝试缓解内存带宽瓶颈。
+
+4. **参考信息**  
+用户在 Issue 中使用了 13900K CPU 与 7900XTX 24G GPU，构建时基于 hipBLAS，结果显示 GPU 推理速度未超过 CPU，表明当前 HIP 后端在实际应用中尚未达到预期性能优势。
+
+总结：目前 AMD GPU 在 llama.cpp 中的推理性能受限于软件栈和硬件适配，建议暂时以 CPU 为主，关注后续 ROCm 和 HIPBLAS 的优化更新。",Issue #3422
+3,Issue驱动,Bug修复链路,Issue #19420,我在使用 llama.cpp 时遇到了类似的问题：Qwen3-Coder-30B-A3B-Instruct crash in vulkan Intel ARL。可能是什么原因导致的？应该怎么排查？,"1. **问题症状**  
+用户在 Intel Arrow Lake (140T GPU) 平台上，使用 llama.cpp 的 Vulkan 后端加载 Qwen3-Coder-30B-A3B-Instruct 模型时，程序发生崩溃。该问题仅在 Vulkan 版本出现，CPU 后端正常运行，表明与 Vulkan 相关的图形驱动或内存管理存在异常。
+
+2. **根本原因**  
+该崩溃主要源于 Vulkan 后端对 Intel ARL GPU 特性的兼容性不足，尤其是在内存分配和缓冲区管理方面。Qwen3-Coder-30B-A3B-Instruct 模型体积大，量化格式（Q4_K_M）对内存访问模式要求较高，导致 Vulkan 驱动在处理大规模 GPU 资源时出现非法访问或同步问题。此外，Intel Vulkan 驱动在某些内存布局和同步机制上与通用实现存在差异，触发了崩溃。
+
+3. **修复思路**  
+排查应聚焦于 Vulkan 后端的内存分配策略和同步机制，尤其是针对 Intel ARL GPU 的特殊处理。建议通过开启 `GGML_VK_MEMORY_LOGGER=1` 等调试日志，定位具体崩溃点。重点检查缓冲区创建、映射、释放流程，确保符合 Intel Vulkan 驱动的规范。还需验证量化模型在 Vulkan 端的 tensor 访问是否越界或未正确同步。
+
+4. **修复方案**  
+已有 PR 针对该问题进行了修复，主要通过调整 Vulkan 内存分配逻辑，增加对 Intel ARL GPU 特性的兼容性支持，优化缓冲区同步和访问顺序，避免非法内存访问。同时，修复了模型加载时的内存布局错误，确保量化格式在 Vulkan 端正确解析和使用。该修复显著提升了 Vulkan 后端在 Intel ARL 平台的稳定性，避免了崩溃。建议用户更新至包含该 PR 的最新版本。","Issue #19420, PR #20059"
+4,Issue驱动,Bug排查,Issue #16799,我遇到了这个问题：ROCm illegal memory access with `-sm row`。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在使用 ROCm 平台运行 llama.cpp 时，开启 `-sm row`（即按行分块计算）参数会导致非法内存访问（illegal memory access）错误，程序在模型预热阶段崩溃。而切换到 `-sm layer` 模式或仅使用 AMD GPU（gfx906）单独运行时，该问题不复现。
+
+2. **可能原因**  
+`-sm row` 模式下，llama.cpp 采用按行分割的方式将计算任务拆分到 GPU，涉及更复杂的内存访问和同步机制。ROCm 对于 gfx906 设备的内存管理和线程调度与 NVIDIA CUDA 不同，且用户使用的 ROCm 7.0.1 版本与模型所用的 Tensile 库（6.4.3）版本不匹配，可能导致底层内存访问越界或同步异常。此外，混合多 GPU（NVIDIA + AMD）环境下，跨设备内存协调复杂，容易触发此类错误。
+
+3. **排查思路**  
+- 确认 ROCm 和 Tensile 库版本匹配，建议统一升级或降级至兼容版本。  
+- 单独在 AMD GPU 上测试，排除多 GPU 交互问题。  
+- 通过开启 ROCm 的调试日志和内存访问检测工具，定位具体崩溃点。  
+- 对比 `-sm row` 和 `-sm layer` 模式下的内存分配和访问逻辑，检查是否存在越界或未同步的缓冲区。  
+- 简化模型规模和输入，缩小问题范围。
+
+4. **已知结论**  
+该 Issue 暂无官方修复，社区反馈表明问题与 ROCm 版本和 Tensile 库不匹配密切相关。建议用户使用 `-sm layer` 模式作为临时规避方案，等待后续 ROCm 或 llama.cpp 对 ROCm 支持的改进。未来版本可能会针对 ROCm 的异构计算和内存管理做更完善的适配。",Issue #16799
+5,Issue驱动,性能问题,Issue #1129,llama.cpp 推理时遇到性能问题：Performance issues with cuBLAS and a bug。有什么优化建议？,"针对 Issue #1129 中反馈的 cuBLAS 性能问题，分析如下：
+
+1. **性能瓶颈**  
+核心瓶颈在于 cuBLAS 调用的开销和数据准备不充分。虽然单次大规模矩阵乘法在理论上能显著加速，但 llama.cpp 中频繁的小批量矩阵乘法导致大量调用开销累积，且内存传输与布局未做充分优化，导致 GPU 计算资源未被充分利用，反而拖慢整体推理速度。
+
+2. **影响范围**  
+该问题主要影响使用 NVIDIA GPU 并启用 cuBLAS 支持的推理场景，尤其是模型规模中等（如 llama-7B）且推理批次较小的情况下更为明显。CPU 推理或未启用 cuBLAS 的场景不受影响。
+
+3. **优化方向**  
+- 预先准备和连续分配内存，减少内存拷贝和重分配开销。  
+- 批量合并多次小矩阵乘法，减少 cuBLAS API 调用次数，提高调用效率。  
+- 采用异步计算与数据传输，充分利用 CUDA 流和并行计算能力。  
+- 针对 llama.cpp 的具体计算流程，重构矩阵乘法调用逻辑，避免循环中频繁调用 cuBLAS。  
+- 目前可通过关闭 cuBLAS 或仅在大规模矩阵乘法时启用，避免整体性能下降。
+
+4. **参考信息**  
+Issue 中提到单次 1千万元素的 F32 矩阵乘法用 cuBLAS 从1秒降至20毫秒，说明单次调用性能极佳；但在 llama 推理循环中，启用 cuBLAS 反而使平均计算时间从300ms升至1500ms，表明调用开销和内存管理是主要瓶颈。
+
+综上，cuBLAS 在 llama.cpp 中的性能提升潜力巨大，但需针对调用粒度和内存管理做专项优化，当前建议谨慎启用并关注后续版本优化进展。",Issue #1129
+6,Issue驱动,Bug排查,Issue #13765,我遇到了这个问题：vulkan prompt processing suddenly slows down once I reach a certain prompt size。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户反馈在使用 llama.cpp Vulkan 后端时，prompt 处理速度在达到一定长度（如385或202 tokens）后突然显著变慢，但文本生成阶段速度正常。该问题仅影响 prompt 预处理阶段，且在不同 GPU（FirePro W8100、RX 470）和驱动（RADV）环境下均出现。
+
+2. **可能原因**  
+llama.cpp 在 Vulkan 后端中，prompt 处理涉及多次 GPU 计算调度和内存管理。随着 prompt 长度增加，输入数据和中间状态会占用更多显存和计算资源，可能触发了某些资源瓶颈或同步机制。尤其是 Vulkan 的命令缓冲区管理、内存分配碎片或队列提交策略，可能导致性能突然下降。此外，量化格式（Q4_K_M、Q4_K_S）和全层 offload 也可能影响内存访问模式和缓存效率。
+
+3. **排查思路**  
+- 监控 GPU 资源使用情况（显存、计算单元利用率）及 Vulkan 命令队列状态，确认是否存在资源饱和或阻塞。  
+- 逐步缩减 prompt 长度，定位触发性能下降的临界点。  
+- 对比不同量化格式和 offload 配置，排查是否与特定配置相关。  
+- 使用 Vulkan 性能分析工具（如 RADV 的调试层）检查命令缓冲区提交和同步开销。  
+- 在 CPU 后端或其他 GPU 驱动环境下复现，排除硬件或驱动特异性问题。
+
+4. **已知结论**  
+该 Issue 目前仍在调查阶段，尚无明确修复方案。开发者建议持续关注后续更新，社区反馈和驱动层改进可能带来解决。同时，临时可通过控制 prompt 长度或调整 offload 策略缓解性能下降。",Issue #13765
+7,Issue驱动,性能问题,Issue #17783,llama.cpp 推理时遇到性能问题：Slow inference with panvk。有什么优化建议？,"针对在 RK3588 平台使用 panvk（Panfrost Vulkan 驱动）导致 llama.cpp 推理速度显著下降的问题，分析如下：
+
+1. **性能瓶颈**  
+核心原因在于 panvk 驱动的 Vulkan 实现尚处于早期阶段，驱动对 GPU 资源调度和命令提交效率较低，导致推理过程中 Vulkan 计算任务的吞吐率远低于 CPU 直接计算。此外，RK3588 的 GPU 架构和驱动对 Vulkan 的支持不完善，影响了并行度和内存访问效率。
+
+2. **影响范围**  
+主要影响基于 RK3588 及类似 ARM 平台，使用 panvk Vulkan 驱动进行推理的场景。尤其是在使用小模型或短文本推理时，token 生成速度明显低于 CPU 模式。其他 Vulkan 驱动成熟的设备（如桌面 GPU）受影响较小。
+
+3. **优化方向**  
+- 暂时建议关闭 Vulkan，使用 CPU 模式（`--device none`）以获得更稳定的推理速度。  
+- 通过调整并行线程数（`n_parallel`）和 KV 缓存统一配置（`kv_unified`）尝试缓解性能瓶颈，但效果有限。  
+- 关注 panvk 驱动及 Linux 内核的更新，未来驱动成熟后 Vulkan 性能有望提升。  
+- 对于 RK3588 等平台，考虑使用专门优化的 GPU 推理库或框架替代 Vulkan。
+
+4. **参考信息**  
+在 Orange Pi 5 Plus（RK3588）上，开启 Vulkan 推理时速度约为 3.6 tokens/sec，而关闭 Vulkan 使用 CPU 模式时速度提升至约 13.2 tokens/sec，差距明显。该设备运行 Artix Linux 6.18.0，编译环境为 GCC 15.2.1，模型配置启用了 4 线程并统一 KV 缓存。
+
+综上，当前 panvk Vulkan 驱动的性能限制是主要瓶颈，建议暂时回退至 CPU 模式，并持续关注驱动生态的改进。",Issue #17783
+8,Issue驱动,Bug修复链路,Issue #19955,我在使用 llama.cpp 时遇到了类似的问题：Vulkan llama-server crashes with vk::DeviceLostError randomly (long contexts)。可能是什么原因导致的？应该怎么排查？,"1. **问题症状**  
+用户在使用 Vulkan 后端的 llama-server 进行长上下文推理时，程序会随机崩溃，报错为 `vk::DeviceLostError`。崩溃通常发生在处理数万 token 后，且伴随系统短暂冻结，导致推理无法继续。
+
+2. **根本原因**  
+该错误通常是 Vulkan 设备（GPU）在长时间高负载运行时发生了设备丢失（Device Lost），可能由显存泄漏、资源管理不当或驱动/硬件异常引起。具体到 llama.cpp，推测是在长上下文推理过程中，GPU 资源（如缓冲区、命令缓冲、同步对象）未被正确释放或重用，导致 Vulkan 驱动崩溃。
+
+3. **修复思路**  
+排查应重点关注 Vulkan 资源的生命周期管理，确认是否存在未释放或重复使用的资源。建议：  
+- 检查命令缓冲区和同步机制是否正确重置和提交。  
+- 监控显存使用情况，排查内存泄漏。  
+- 复现问题时开启 Vulkan 验证层，捕获更详细的错误信息。  
+- 对比不同模型和设备的表现，排除硬件兼容性问题。
+
+4. **修复方案**  
+已有 PR 通过改进 Vulkan 资源管理实现修复，主要包括：  
+- 优化命令缓冲区的重用逻辑，确保每次推理循环正确重置。  
+- 增强同步机制，防止命令提交冲突。  
+- 修复部分显存释放遗漏，避免累积内存压力。  
+这些改动显著降低了 `vk::DeviceLostError` 的发生频率，提升了长上下文推理的稳定性。建议尽快合并并更新至最新版本。","Issue #19955, PR #20296"
+9,Issue驱动,Bug排查,Issue #17012,我遇到了这个问题：Qwen3-VL-8B freezes on image processing tasks。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+Qwen3-VL-8B 模型在处理图像任务时出现程序冻结，尤其是在上传图像到 Web UI 或 Open-WebUI 后，程序无响应甚至导致 Windows 系统卡死。文本生成部分正常，无明显异常。
+
+2. **可能原因**  
+Qwen3-VL-8B 是多模态模型，涉及图像特征处理和推理。冻结现象多半与图像输入的预处理、模型加载或 Vulkan GPU 计算管线相关。结合 llama.cpp 架构，可能是：  
+- Vulkan 后端在处理图像相关计算时出现死锁或资源竞争。  
+- 图像输入的预处理或特征转换流程存在内存访问异常或阻塞。  
+- 模型的量化文件（gguf）与 mmproj 配置不匹配，导致运行时状态异常。  
+- 版本升级引入了不兼容的改动，导致图像处理路径代码异常。
+
+3. **排查思路**  
+- 回退到已知正常版本（如 b6910）确认是否版本引入问题。  
+- 通过开启详细日志或调试模式，定位冻结发生的具体函数调用或线程状态。  
+- 检查 Vulkan 驱动和硬件兼容性，尝试切换 CPU 模式或禁用 Vulkan 测试是否仍冻结。  
+- 验证图像输入格式和预处理代码，确保符合模型预期。  
+- 对比 gguf 和 mmproj 文件版本，确认参数一致性。  
+- 使用最小复现用例逐步排除，确认是否为特定图像或操作触发。
+
+4. **已知结论**  
+目前 Issue 中尚无官方明确修复方案，冻结问题与近期 Vulkan 后端更新相关。建议使用稳定版本回退，同时关注后续版本更新和社区反馈。开发团队正在跟进 Vulkan 相关的稳定性改进。用户可临时切换到 CPU 模式或降低上下文大小尝试规避。",Issue #17012
+10,Issue驱动,Bug排查,Issue #9473,我遇到了这个问题：Build failure in master on Ubuntu 24.04 with CUDA enabled。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在 Ubuntu 24.04 环境下启用 CUDA 编译 llama.cpp 时，出现构建失败。该问题自 9 月中旬开始出现，使用的编译器为 gcc 13.2，CUDA 版本为 12.6，且系统和工具链均为最新版本。
+
+2. **可能原因**  
+llama.cpp 的 CUDA 支持依赖于 nvcc 与 gcc 的兼容性。Ubuntu 24.04 默认 gcc 版本较新（13.x），而 CUDA 12.6 官方对 gcc 13 的支持尚不完善，可能导致编译器内部调用错误或不兼容的编译选项。此外，CUDA 12.6 的某些内部头文件或宏定义更新，也可能与 llama.cpp 的 CUDA 代码存在细微冲突。
+
+3. **排查思路**  
+- 首先确认具体的编译错误日志，定位是 nvcc 编译阶段还是链接阶段失败。  
+- 尝试切换 gcc 版本（如降级到 gcc 11 或 12）进行编译，验证是否为编译器兼容性问题。  
+- 检查 CUDA 代码中是否有使用过时或不兼容的语法或宏定义。  
+- 对比之前成功构建的环境配置，确认系统库和 CUDA Toolkit 版本差异。  
+- 关注社区和官方发布的针对 CUDA 12.6 与 gcc 13 的兼容性补丁或建议。
+
+4. **已知结论**  
+目前该 Issue 尚未有官方修复发布，社区普遍建议在 Ubuntu 24.04 上使用 gcc 11/12 版本编译 CUDA 代码以规避兼容性问题。后续 llama.cpp 可能会调整 CUDA 编译配置或提供更好的兼容性支持。用户可关注后续更新或临时切换编译器版本解决构建失败。",Issue #9473
+11,Issue驱动,Bug排查,Issue #107,我遇到了这个问题：inlining failed in call to always_inline ‘_mm256_cvtph_ps’: target specific opti。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+编译 llama.cpp 时，出现类似“inlining failed in call to always_inline ‘_mm256_cvtph_ps’: target specific option mismatch”的错误，导致编译失败。该错误通常发生在使用 SIMD 指令集相关的内联函数时，编译器无法找到对应的硬件支持或编译选项不匹配。
+
+2. **可能原因**  
+llama.cpp 中部分性能关键代码依赖 AVX、AVX2 或 AVX512 等 SIMD 指令集，尤其是半精度浮点转换函数 `_mm256_cvtph_ps`。该函数要求编译器启用对应的 CPU 指令集扩展（如 `-mavx2` 或 `-mavx512f`）。如果编译环境默认未开启这些选项，或者目标 CPU 不支持，编译器会报错。此外，某些编译器版本或平台对这些内联函数支持不完善，也可能导致此问题。
+
+3. **排查思路**  
+- 检查编译命令行，确认是否包含了正确的 `-mavx2` 或相关指令集编译选项。  
+- 使用 `cat /proc/cpuinfo` 或类似工具确认本机 CPU 是否支持相关指令集。  
+- 尝试升级或更换编译器版本（如 gcc、clang），以排除编译器兼容性问题。  
+- 查看 Makefile 或 CMakeLists.txt 中是否正确设置了目标架构和编译选项。  
+- 若使用交叉编译或非标准环境，确认目标平台支持对应指令集。
+
+4. **已知结论**  
+该问题在 Issue #107 中主要因编译选项缺失导致。解决方案是确保编译时启用正确的 CPU 指令集支持选项（如 `-mavx2`），并使用支持这些指令集的编译器版本。官方默认构建脚本通常会自动处理，但手动编译时需注意。若硬件不支持，建议关闭相关优化或在配置中禁用对应指令集。",Issue #107
+12,Issue驱动,性能问题,Issue #17033,llama.cpp 推理时遇到性能问题：performance regression in `llama-server` (`ggml-vulkan`)。有什么优化建议？,"针对 `llama-server` 在使用 `ggml-vulkan` 后出现的性能回退问题，分析如下：
+
+1. **性能瓶颈**  
+此次性能回退的核心原因是最近一次合并（commit cd5e3b575）引入了对 Vulkan 后端调度或内存管理的改动，导致 GPU 资源利用率下降，具体表现为命令缓冲区提交效率降低和同步开销增加，从而影响了推理吞吐量。
+
+2. **影响范围**  
+该问题主要影响基于 Vulkan 的 GPU 推理环境，尤其是在 Windows 和 Linux 平台上使用 `llama-server` 的场景。与之对比，Metal 后端未出现类似回退，说明问题与 Vulkan 特定的驱动或调度实现相关。模型规模上，中大型模型推理时性能下降更明显。
+
+3. **优化方向**  
+- 回退至引入回退前的稳定版本，等待后续修复。  
+- 关注 Vulkan 命令缓冲区的合理复用，减少提交次数。  
+- 优化同步机制，避免不必要的阻塞。  
+- 结合 Vulkan 驱动特性，调整内存分配策略和队列优先级。  
+- 关注社区后续补丁和性能测试反馈，及时更新。  
+
+4. **参考信息**  
+Issue 中通过对比性能曲线图，明确定位到 cd5e3b575 合并引入的变更是性能下降的起点，且 Metal 后端无此问题，排除了通用代码改动的影响，指向 Vulkan 后端实现细节的回退。
+
+综上，建议暂时使用稳定版本，关注 Vulkan 后端的调度和同步优化，等待核心团队针对该提交的修复。",Issue #17033
+13,Issue驱动,Feature需求,Issue #16331,llama.cpp 目前支持 DeepSeek V3.2-Exp support 吗？社区有没有相关的讨论或计划？,"关于 DeepSeek V3.2-Exp 在 llama.cpp 中的支持问题，现做如下说明：
+
+1. **需求背景**  
+DeepSeek V3.2-Exp 是一种针对模型推理效率和灵活性优化的扩展格式，旨在提升加载速度和内存利用率，尤其适合大规模推理场景。用户希望通过支持该格式，获得更快的模型加载和更低的资源消耗，从而改善部署体验。
+
+2. **当前状态**  
+截至目前，llama.cpp 官方版本尚未原生支持 DeepSeek V3.2-Exp 格式。项目主要聚焦于原生 llama 模型及其衍生格式的高效推理。虽然社区中有部分开发者参考了 VLLM 实现的相关代码，尝试探索兼容方案，但尚无稳定合并的支持分支或官方发布。
+
+3. **社区态度**  
+在 Issue #16331 中，社区对引入 DeepSeek V3.2-Exp 表现出一定兴趣，认可其潜在价值，但也指出该功能实现复杂度较高，且需要权衡维护成本与实际收益。目前讨论更多集中在评估需求优先级和技术可行性，尚未形成明确的开发计划。
+
+4. **使用建议**  
+对于有迫切需求的开发者，建议关注社区动态和相关分支，尝试基于 VLLM 代码进行二次开发或实验。同时，可考虑使用现有的 llama.cpp 版本配合模型量化和优化技巧，以获得较优性能。若项目对 DeepSeek V3.2-Exp 有强依赖，建议权衡使用支持该格式的其他推理框架。
+
+总结：DeepSeek V3.2-Exp 支持尚处于探索阶段，官方暂未集成，社区关注度中等，建议根据实际需求选择合适方案并密切跟进后续进展。",Issue #16331
+14,Issue驱动,Feature需求,Issue #4381,llama.cpp 目前支持 add Mixtral support 吗？社区有没有相关的讨论或计划？,"关于“llama.cpp 支持 Mixtral 模型”的需求，现做如下说明：
+
+1. **需求背景**  
+Mixtral 是 Mistral 团队推出的基于 Mixture of Experts（MoE）架构的模型，因其在推理效率和性能上的潜力，受到社区关注。用户希望在 llama.cpp 中直接支持 Mixtral，以便利用轻量级本地推理框架运行该模型，满足低延迟和资源受限环境下的应用需求。
+
+2. **当前状态**  
+截至目前，llama.cpp 官方尚未原生支持 Mixtral 模型。主要原因在于 Mixtral 的 MoE 结构与 llama.cpp 现有的模型加载和推理流程存在架构差异，尤其是专家路由机制尚未集成。社区中暂无成熟的替代方案，但部分用户尝试通过自定义修改或外部转换工具进行适配，效果有限且不稳定。
+
+3. **社区态度**  
+Issue #4381 中，社区对增加 Mixtral 支持表现出浓厚兴趣，讨论主要集中在实现 MoE 路由逻辑的技术难点和性能权衡。部分开发者建议先完善基础模型兼容性，再逐步引入 MoE 支持。整体来看，支持 Mixtral 被视为中长期目标，当前优先级相对较低。
+
+4. **使用建议**  
+对于急需使用 Mixtral 模型的开发者，建议关注官方更新和社区贡献，积极参与讨论以推动支持进展。短期内可考虑使用官方或第三方提供的专用推理框架，结合 llama.cpp 做辅助处理。若具备较强开发能力，也可尝试基于现有代码库自行实现 MoE 路由模块，但需注意维护成本和稳定性风险。
+
+总结：Mixtral 支持是一个复杂且尚在规划中的功能，社区欢迎贡献，建议关注 Issue 动态并结合现有工具进行实验。",Issue #4381
+15,Issue驱动,Bug排查,Issue #16416,我遇到了这个问题：Nemotron-H-47B-Reasoning always reprocesses prompt (even after #16382)。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+Nemotron-H-47B-Reasoning 模型在使用 llama.cpp 进行推理时，尽管合并了 PR #16382，仍然每次都重新处理完整提示（prompt），上下文缓存（kv-cache）未生效，导致推理效率低下且响应时间增长。
+
+2. **可能原因**  
+llama.cpp 的上下文缓存机制依赖于模型的 kv-cache 支持和正确的 prompt 分段处理。Nemotron-H-47B-Reasoning 属于混合量化模型（hybrid model），其权重格式和缓存策略可能与标准模型不同。PR #16382 针对部分混合模型修复了缓存逻辑，但 Nemotron-H-47B-Reasoning 可能存在特殊的权重布局或缓存索引未正确处理，导致缓存未被正确识别或复用。
+
+3. **排查思路**  
+- 检查模型加载时 kv-cache 是否正确初始化，确认模型文件格式与 llama.cpp 版本兼容。  
+- 通过调试日志或增加打印，确认每次推理调用时缓存是否被命中，及缓存状态变化。  
+- 对比 Nemotron-H-47B-Reasoning 与其他混合模型的缓存处理流程，定位是否存在特殊处理遗漏。  
+- 复现问题时，尝试使用简单 prompt，观察缓存行为是否一致，排除输入长度或格式问题。  
+- 关注 llama-server 配置，确认 kv-cache 参数是否正确传递和生效。
+
+4. **已知结论**  
+目前 Issue #16416 中尚无明确修复方案，PR #16382 对部分混合模型有效，但 Nemotron-H-47B-Reasoning 仍未解决。建议关注后续 PR 更新，或在社区中提供详细模型信息和复现步骤，协助定位缓存兼容性问题。短期内可通过减少 prompt 长度或手动管理缓存状态作为临时缓解。",Issue #16416
+16,Issue驱动,Bug修复链路,Issue #19690,"llama.cpp 中出现了这个问题： qwen35moe always forces a full prompt reprocess after each message, 'failed to 。这是什么原因？社区是怎么解决的？","1. **问题症状**  
+在使用 qwen35moe 模型时，每次生成回复时都会强制对整个提示词（prompt）进行完整重处理，而非增量处理，导致性能大幅下降。此外，日志中会出现“failed to truncate”错误提示，影响正常的上下文管理和续写效率。
+
+2. **根本原因**  
+该问题源于模型量化格式（Q5_K_XL）与 llama.cpp 中上下文截断逻辑的不兼容。具体表现为模型状态在多轮对话中未能正确保存和复用，导致每次生成都必须重新处理完整上下文。截断函数在处理量化权重时未能正确识别和截断对应层，触发“failed to truncate”错误。
+
+3. **修复思路**  
+排查应聚焦于上下文管理模块，尤其是截断（truncate）逻辑对量化模型权重的支持。需要确认截断函数能正确识别所有量化层的命名和结构，确保多轮对话时能增量更新上下文状态。调试时应结合具体量化格式的权重文件结构，验证截断操作的正确性。
+
+4. **修复方案**  
+社区通过 PR #19715 对截断逻辑进行了改进，增强了对 Qwen3.5 量化模型中特殊层命名的支持，修正了截断函数对量化权重的识别和处理。该修复使得多轮对话时能够正确截断和复用上下文状态，避免了每次生成都重新处理完整提示，从而解决了性能瓶颈和“failed to truncate”错误。","Issue #19690, PR #19849"
+17,Issue驱动,Bug修复链路,Issue #17628,我发现 llama.cpp 的某模块性能下降了，可能是什么原因？有没有已知的修复方案？,"1. **问题症状**  
+在使用 Vulkan 后端运行 llama.cpp 时，尤其是在 Intel Arc A770 GPU 上，模型推理的吞吐率（tokens per second）明显下降。例如，从版本 b7189 升级到 b7209 后，token 生成速度从 53 t/s 降至 42 t/s，整体性能出现明显退化。
+
+2. **根本原因**  
+该性能下降主要源自 Vulkan 后端某次提交引入的资源管理和调度策略变更，导致 GPU 计算流水线利用率降低。此外，部分前向激活（FA，forward activation）缓存机制存在不合理的同步或内存访问模式，增加了额外的延迟和开销，进而影响整体性能。
+
+3. **修复思路**  
+应重点排查 Vulkan 后端的命令缓冲区提交顺序、同步机制以及缓存管理策略，尤其是与前向激活缓存相关的实现。通过对比性能变化前后的代码差异，定位引入性能瓶颈的具体改动。优化 GPU 资源调度，减少不必要的同步等待，确保计算和内存访问的高效并行。
+
+4. **修复方案**  
+已有 PR 针对该问题进行了修复，主要包括：调整 Vulkan 命令缓冲区的提交逻辑，优化前向激活缓存的访问模式，避免重复计算和不必要的同步操作。修复后，模型推理速度恢复至之前的水平，性能退化问题得到有效解决。建议尽快合并该 PR 并进行回归测试。","Issue #17628, PR #20672"
+18,Issue驱动,性能问题,Issue #603,llama.cpp 推理时遇到性能问题：gpt4all Faster than Optimized llama.cpp。有什么优化建议？,"针对 llama.cpp 推理性能不及 gpt4all 的问题，分析如下：
+
+1. **性能瓶颈**  
+主要原因在于当前版本的 llama.cpp 采用了更严格的硬件适配和优化策略，导致部分平台上某些指令集或多线程调度未能充分发挥效能。另外，模型加载和缓存机制的差异也可能引起性能波动。gpt4all 使用的旧版本可能在特定硬件上有更轻量的实现，减少了开销。
+
+2. **影响范围**  
+该问题主要影响使用多线程和 SIMD 指令集优化的 x86_64 架构，尤其是未针对具体 CPU 特性（如 AVX2/AVX512）进行细粒度调优的场景。大型模型（如 7B 及以上）推理时更明显，因计算和内存带宽需求较高。
+
+3. **优化方向**  
+- 确认编译时开启了针对目标 CPU 的最佳指令集支持（如 `-march=native` 或手动指定 AVX2/AVX512）。  
+- 调整线程数，避免过度线程竞争，建议从 1 到 CPU 核心数逐步测试。  
+- 使用最新的 llama.cpp 代码库，关注社区对性能相关 PR 的合并情况。  
+- 结合 `--low_vram`、`--no_mmap` 等参数，根据硬件内存和存储性能调整模型加载方式。  
+- 关注模型量化和内存布局优化，减少内存访问瓶颈。
+
+4. **参考信息**  
+Issue 中提到，gpt4all 默认使用的 llama.cpp 版本较旧，但在相同模型和硬件上表现更快，暗示新版本在某些实现细节上存在性能倒退。建议用户结合硬件特性和实际使用场景，调整编译和运行参数以获得最佳性能。
+
+总结：性能差异多因硬件适配和多线程调度策略不同，合理配置编译选项和运行参数是提升 llama.cpp 性能的关键。",Issue #603
+19,Issue驱动,Bug修复链路,Issue #19659,"llama.cpp 中出现了这个问题：[CUDA, cuBLAS] Corrupted output on CUBLAS with moe models like Nemotron-3-nano a。这是什么原因？社区是怎么解决的？","1. **问题症状**  
+在使用支持 MoE（Mixture of Experts）架构的模型（如 Nemotron-3-nano 30B 和 gpt-oss-120b）时，若在 CUDA 环境下（特别是 sm70 设备，如 Tesla V100）处理长上下文（通常超过 25000 tokens），会出现输出结果严重异常，表现为输出内容被单一 token 持续刷屏，且即使清空或切换上下文缓冲区问题依旧存在，导致模型推理结果完全错乱。
+
+2. **根本原因**  
+该问题源于 cuBLAS 库在执行大批量矩阵乘法时，针对 MoE 模型的特殊计算路径存在内存访问越界或缓冲区管理不当的情况。具体表现为在长序列输入触发大批量矩阵乘法优化模式时，内部状态或指针未正确同步，导致显存数据被破坏，输出被污染。
+
+3. **修复思路**  
+排查重点应放在 cuBLAS 调用的参数设置、缓冲区分配与复用逻辑，尤其是针对 MoE 模型的多专家路由和大批量矩阵乘法模式。需要确认长上下文处理时的内存管理是否符合预期，避免指针混淆或越界访问。调试时可通过缩短输入长度、切换设备或禁用大批量优化模式定位问题。
+
+4. **修复方案**  
+社区通过限制长上下文下大批量矩阵乘法模式的自动启用，或者调整 MoE 模型的矩阵乘法调用逻辑，确保每次调用时缓冲区和指针状态正确同步，避免内存覆盖。相关 PR 主要修正了 cuBLAS 调用的参数传递和缓冲区管理，保证在长输入和 MoE 路由场景下数据完整性，从根本上杜绝了内存破坏和输出污染问题。","Issue #19659, PR #19916"
+20,Issue驱动,Feature需求,Issue #6747,llama.cpp 目前支持 llama3 family support 吗？社区有没有相关的讨论或计划？,"关于 llama3 family 支持的需求，主要动机是用户希望能在 llama.cpp 中运行最新发布的 LLaMA 3 模型，以利用其在性能和能力上的提升，满足更高质量的推理和研究需求。这对于希望在本地或边缘设备上部署先进语言模型的开发者和研究者尤为重要。
+
+目前，llama.cpp 官方尚未正式支持 LLaMA 3 系列模型，主要因为 LLaMA 3 的模型格式和权重尚未完全公开或标准化，且其体积和架构可能带来额外的适配工作。现阶段，用户可以继续使用 llama.cpp 支持的 LLaMA 2 或更早版本模型，或者借助官方或第三方工具将 LLaMA 3 权重转换为兼容格式，但这存在一定技术门槛和不确定性。
+
+从社区反馈来看，Issue #6747 中用户表达了强烈的期待，开发者和社区成员也关注这一需求，讨论多集中在模型格式兼容性、性能优化和权重获取的合法性问题。整体态度积极，期待官方或社区能尽快推动支持，但尚无明确时间表。
+
+建议开发者关注 llama.cpp 官方仓库的更新公告，参与社区讨论，关注权重格式的发布和转换工具的进展。如果急需使用 LLaMA 3，可以尝试使用官方提供的其他框架或等待社区贡献的转换方案，同时做好模型适配和性能调优的准备。",Issue #6747
+21,Issue驱动,Bug排查,Issue #11044,我遇到了这个问题：SYCL out of memory error。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在使用 llama.cpp 的 SYCL 后端时遇到“out of memory”错误，提示无法分配约 568MB 内存。该问题在相同硬件（16GB GPU共享内存）和相同模型配置下，使用 VULKAN 后端时未出现。错误不仅在 llama-cli 中出现，Python 绑定（llama-cpp-python）也会复现，且在多个版本中均存在。
+
+2. **可能原因**  
+llama.cpp 的 SYCL 后端依赖于底层 SYCL 运行时对显存的管理。由于 SYCL 主要面向多平台异构计算，内存分配策略和碎片化问题较 Vulkan 更复杂。共享系统内存（非独立显存）可能导致内存分配限制更严格，且 SYCL 运行时可能未能有效回收或复用内存块。此外，模型加载和中间缓存的内存需求较大，若内存碎片严重或分配策略不合理，容易触发分配失败。
+
+3. **排查思路**  
+- 确认 SYCL 运行时及驱动版本是否最新，避免已知内存管理缺陷。  
+- 监控显存使用情况，观察内存碎片和峰值分配，排除内存泄漏。  
+- 尝试减少模型上下文长度或 batch size，验证是否因内存需求过大导致。  
+- 对比 Vulkan 与 SYCL 后端的内存分配逻辑，定位差异。  
+- 在不同硬件或操作系统环境下复现，排除特定平台限制。  
+
+4. **已知结论**  
+该 Issue 中未见明确修复方案，问题可能与 SYCL 后端内存管理机制相关，且在共享系统内存环境下更易出现。建议优先使用 Vulkan 后端或独立显存设备运行，等待后续 SYCL 运行时和 llama.cpp 的优化更新。社区也欢迎提供更多复现环境信息以协助定位。",Issue #11044
+22,Issue驱动,Bug排查,Issue #5186,我遇到了这个问题：Subtle Vulkan shader compilation bug when running on Adreno GPUs (Samsung Galaxy。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+在使用 llama.cpp 运行基于 Vulkan 的推理时，部分搭载 Adreno GPU（如 Samsung Galaxy S23 Ultra）的设备出现 shader 编译异常或渲染错误，导致模型推理失败或结果异常。这种问题表现为 Vulkan shader 在编译阶段产生 subtle（微妙）错误，难以直接定位。
+
+2. **可能原因**  
+llama.cpp 在 Vulkan 后端中大量依赖 GPU shader 来加速张量计算。Adreno GPU 的 Vulkan 驱动在特定 shader 代码路径或优化级别下，可能存在编译器缺陷或兼容性问题。尤其是针对复杂的 compute shader，驱动的 shader compiler 可能生成错误的机器码，导致计算结果异常。此类问题往往与 shader 代码的某些写法（如特定的内存访问模式、分支结构）或 Vulkan API 使用细节有关。
+
+3. **排查思路**  
+- 复现问题时，开启 Vulkan 层调试和 shader 编译日志，捕获具体的编译错误或警告信息。  
+- 尝试简化 shader 代码，逐步缩小问题范围，确认是否某些指令或代码结构触发驱动 bug。  
+- 在不同 Adreno 驱动版本和设备上测试，确认是否为特定版本驱动缺陷。  
+- 使用 Vulkan SDK 的 shader validator 工具检查 shader 代码合规性。  
+- 结合 llama.cpp 的 Vulkan 后端源码，检查是否存在对 Vulkan 规范的误用。
+
+4. **已知结论**  
+目前该 Issue 暂无官方修复方案，Qualcomm 驱动版本信息表明问题与其 shader compiler 版本相关。短期内建议尝试切换驱动版本或使用 CPU 后端作为替代。社区可尝试调整 shader 代码结构，规避触发驱动 bug 的写法，或向 Qualcomm 反馈该编译器缺陷以期获得官方修复。",Issue #5186
+23,Issue驱动,Bug排查,Issue #15789,我遇到了这个问题：gpt-oss-20b returns only analisys chunk w/o content and tools。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户运行 gpt-oss-20b 模型时，模型返回的响应仅包含“analysis”类型的片段，缺少实际内容和工具调用信息，导致输出不完整，无法正常执行预期的推理或工具调用。
+
+2. **可能原因**  
+llama.cpp 在处理带有工具调用或多段输出的推理时，依赖于模型的输出格式和推理策略（如 split-mode、reasoning-format 等参数）。该问题可能由以下原因引起：  
+- 模型或推理参数配置不匹配，导致解析器只捕获到了分析片段而忽略了后续内容和工具调用。  
+- 模型权重或 tokenizer 版本与 llama.cpp 解析逻辑不兼容，导致输出被截断或格式异常。  
+- 使用了不支持或未完全实现的推理格式（reasoning-format none），使得模型只输出了分析提示，未生成完整内容。  
+- flash-attn 或多线程等性能优化参数可能引入了推理状态同步问题，影响输出完整性。
+
+3. **排查思路**  
+- 检查模型文件是否完整且与当前 llama.cpp 版本兼容，确认 tokenizer 配置正确。  
+- 逐步简化启动参数，尝试关闭 flash-attn、调整 split-mode 和 reasoning-format，观察输出变化。  
+- 通过增加日志或调试信息，确认模型推理过程中是否完整生成了内容和工具调用片段。  
+- 使用官方示例或其他模型验证推理流程是否正常，排除环境或硬件问题。  
+- 如果可能，尝试用较低版本或不同配置的 llama.cpp 运行该模型，确认是否为版本兼容问题。
+
+4. **已知结论**  
+目前该 Issue 中未见明确修复方案，推测是模型与推理参数配置不匹配导致。建议调整 reasoning-format 参数，或等待后续版本对 gpt-oss-20b 模型的支持优化。同时，关注官方更新和社区反馈，确认是否有针对该模型的专门修复或使用说明。",Issue #15789
+24,Issue驱动,Bug排查,Issue #11325,我遇到了这个问题：<think> tag with DeepSeek-R1-Distill-Qwen-1.5B-Q5_K_M.gguf。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在使用 DeepSeek-R1-Distill-Qwen-1.5B-Q5_K_M.gguf 模型时，生成文本中出现了不应显示的 `<think>` 标签。这种标签通常是模型内部推理或提示用的标记，正常情况下不应直接输出给终端用户。
+
+2. **可能原因**  
+llama.cpp 作为轻量级推理框架，依赖模型本身的 tokenizer 和生成逻辑。出现 `<think>` 标签，可能是模型在训练或量化过程中保留了特殊的控制标记，或者模型权重文件中嵌入了这类标签作为辅助信息。另一种可能是 tokenizer 配置或解码策略未正确处理这些特殊标记，导致它们被当作普通文本输出。
+
+3. **排查思路**  
+- 检查 gguf 模型文件的 tokenizer 配置，确认是否包含 `<think>` 这类特殊 token。  
+- 通过 llama.cpp 的 tokenizer 接口，尝试对输入和输出进行编码解码，观察是否在中间环节出现了异常。  
+- 复现问题时，尝试调整生成参数（如温度、top-p、stop tokens），看是否能避免输出该标签。  
+- 对比官方或其他版本的 Qwen 模型，确认是否为模型自身特性或量化/转换过程引入。  
+- 查看是否有后续更新或补丁修复了相关问题。
+
+4. **已知结论**  
+目前该 Issue 中未见官方明确修复方案或确认是 llama.cpp 代码缺陷。更可能是模型文件本身设计包含了 `<think>` 标签，建议用户联系模型提供方确认标签用途，或在推理时通过 stop token 或后处理过滤该标签。后续可关注 llama.cpp 社区是否有针对该模型的专门适配或修正。",Issue #11325
+25,Issue驱动,Bug修复链路,Issue #19304,我在使用 llama.cpp 时遇到了类似的问题：Lllama.cpp crashes when running Qwen Next 80B Coder。可能是什么原因导致的？应该怎么排查？,"1. **问题症状**  
+在使用 llama.cpp 运行 Qwen Next 80B Coder 模型时，程序在长上下文（约 86K token）多次调用推理接口后崩溃，崩溃点定位在 `llama_grammar_accept_token` 函数，表现为访问非法内存或线程异常终止。
+
+2. **根本原因**  
+该问题主要源于 OpenCL 相关算子（如 concat、repeat、tanh、scale）的实现重构后，部分操作在处理超长上下文或大规模张量时未正确管理内存和数据同步，导致状态不一致或越界访问。此外，部分变量未被正确使用或初始化，进一步加剧了不稳定性。
+
+3. **修复思路**  
+排查重点应放在 OpenCL 计算流程中张量维度和内存边界的正确性，特别是 concat 和 repeat 操作对大上下文的支持。需要验证算子在 fp16 精度下的数值稳定性和内存访问安全。同步机制和变量使用情况也需全面审查，确保无未使用或未初始化变量。
+
+4. **修复方案**  
+PR #19226 通过重构 OpenCL 相关算子，优化了 concat、repeat、tanh 和 scale 的实现，启用了 tanh 的 fp16 支持，并修复了未使用变量问题。该改动增强了算子对大上下文的支持和内存管理的健壮性，从根本上避免了因算子实现缺陷导致的崩溃，解决了 Qwen Next 80B Coder 在长上下文下的稳定性问题。建议升级到包含该 PR 的版本以获得修复。","Issue #19304, PR #19765"
+26,Issue驱动,Bug修复链路,Issue #19513,llama.cpp 中出现了这个问题：Qwen3-Coder-Next generates prematurely EOS instead of tool call(/continued respo。这是什么原因？社区是怎么解决的？,"1. **问题症状**  
+在使用 Qwen3-Coder-Next 模型进行推理时，模型生成过程中出现了异常：在多次成功调用工具接口（tool call）后，模型会提前生成 EOS（End Of Sequence）标记，导致生成过程非预期中断，工具调用未能正常触发，进而使得代理（agent）回合提前结束。
+
+2. **根本原因**  
+该问题主要源于模型推理时对 EOS 标记的判定逻辑不够严谨，尤其是在连续多轮工具调用场景下，模型输出的 token 序列中 EOS token 被误判为生成结束信号，而实际上模型应继续生成后续的工具调用内容。此外，Qwen3-Coder-Next 模型的特殊输出格式和 token 解码策略未能完全兼容，导致生成中断。
+
+3. **修复思路**  
+应重点排查推理流程中 EOS token 的判定逻辑，尤其是结合模型的输出格式，区分真正的结束信号和工具调用标记的边界。需要调整生成终止条件，使其支持连续多轮工具调用的场景，避免误判。同时，检查解码器对特殊 token 的处理，确保工具调用标记能被正确识别和解析。
+
+4. **修复方案**  
+社区通过调整推理代码中 EOS token 的判定条件，增加对工具调用标记的识别支持，避免将工具调用标记误判为结束信号。具体做法包括修改生成终止判断逻辑，允许在检测到工具调用标记时继续生成，直到真正的 EOS token 出现。此外，还优化了模型输出的后处理流程，确保连续多轮工具调用能被正确解析和执行。相关修复已通过 PR 合入，显著改善了 Qwen3-Coder-Next 在工具调用场景下的稳定性和准确性。","Issue #19513, PR #19773"
+27,Issue驱动,Bug排查,Issue #12234,我遇到了这个问题：Excessive stack usage during tool calling。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在使用 llama.cpp 结合 BFCL 和 llama-server 运行模型时，遇到了“Excessive stack usage during tool calling”（工具调用时栈使用过多）导致程序崩溃，且崩溃不具备确定性，部分情况下通过 gdb 捕获到崩溃堆栈信息。
+
+2. **可能原因**  
+llama.cpp 在执行推理或调用外部工具时，部分递归或深度调用可能导致栈空间消耗异常。结合 Issue 中出现的正则表达式处理（regex）相关调用，推测在工具调用链中存在大量临时对象创建或复杂字符串处理，导致栈帧膨胀。此外，模型量化（Q4_K_M）和多线程并发执行可能加剧栈空间压力。NVIDIA RTX 4070 Laptop GPU 及其驱动环境也可能对内存管理有特殊要求，间接影响栈使用。
+
+3. **排查思路**  
+- 使用 gdb 或类似调试工具定位具体崩溃点，关注调用栈深度及异常函数。  
+- 检查工具调用相关代码，尤其是涉及字符串处理、正则表达式的部分，确认是否存在递归或大对象栈分配。  
+- 通过减少线程数或调整模型量化参数，观察栈使用变化。  
+- 在不同硬件和驱动环境下复现问题，排除环境因素。  
+- 结合编译器栈大小设置，尝试增加线程栈大小限制。
+
+4. **已知结论**  
+目前该 Issue 尚无明确修复方案，崩溃表现不稳定，开发团队建议重点排查工具调用链中正则表达式和字符串处理逻辑，优化栈空间使用。后续版本可能通过改进内存管理和调用方式降低栈压力。用户可尝试临时调整线程栈大小或减少并发度缓解问题。",Issue #12234
+28,Issue驱动,Feature需求,Issue #8650,llama.cpp 目前支持 Proper Llama 3.1 Support in llama.cpp 吗？社区有没有相关的讨论或计划？,"1. 需求背景  
+Llama 3.1 相较于前代模型在架构上保持一致，但引入了关键的 RoPE（旋转位置编码）缩放机制更新，这对生成文本的连贯性和质量有显著提升。用户希望在 llama.cpp 中实现这些改动，以充分发挥 Llama 3.1 的潜力，避免生成结果表面连贯但实际表现不佳的情况。
+
+2. 当前状态  
+截至目前，llama.cpp 官方版本尚未完全支持 Llama 3.1 的 RoPE 缩放更新，模型加载和推理仍基于 Llama 2.x 或更早版本的实现。部分社区成员尝试通过修改源码或借助 transformers 库的实现进行适配，但尚无官方集成的稳定方案。
+
+3. 社区态度  
+Issue #8650 中，社区普遍认可 Llama 3.1 支持的重要性，讨论集中在如何合理实现 RoPE 缩放及相关模型参数调整。部分开发者表达了愿意贡献代码，但也指出需要深入理解模型细节和验证性能，避免引入不兼容或效率问题。
+
+4. 使用建议  
+目前建议开发者继续使用已验证的 Llama 2.x 版本模型以保证稳定性。如果需要尝试 Llama 3.1，可以关注 transformers 库中对应实现，结合社区的非官方补丁进行测试。同时，建议关注 llama.cpp 官方仓库的更新动态，参与社区讨论，等待正式支持发布。对于有能力深入源码的开发者，可尝试贡献 RoPE 缩放相关的改进代码，推动功能尽快落地。",Issue #8650
+29,Issue驱动,Feature需求,Issue #7116,llama.cpp 目前支持 Add Support for IBM Granite 吗？社区有没有相关的讨论或计划？,"关于“支持 IBM Granite 模型”的需求，简要说明如下：
+
+1. **需求背景**  
+IBM Granite 是 IBM 新发布的一系列大规模编码模型，覆盖从 3B 到 34B 参数量，包含基础模型和指令微调版本。该系列模型针对代码生成和理解场景进行了优化，适合开发者和研究者在编程辅助、代码分析等任务中使用。llama.cpp 作为轻量级本地推理框架，支持 Granite 模型有助于扩大其应用范围，满足更多用户需求。
+
+2. **当前状态**  
+目前 llama.cpp 尚未原生支持 IBM Granite 模型。虽然 Granite 模型可以转换为 GGUF 格式，但加载时会遇到分词器（tokenizer）错误，导致无法正常推理。这表明模型格式或分词器兼容性尚未完善，尚无官方支持或稳定的替代方案。
+
+3. **社区态度**  
+Issue #7116 中，社区成员对支持 Granite 表现出积极期待，感谢 llama.cpp 团队的努力，并希望尽快解决分词器兼容问题。讨论集中在修复 tokenizer 错误和完善 GGUF 格式支持，尚未形成具体的开发时间表，但社区愿意贡献测试和反馈。
+
+4. **使用建议**  
+目前建议开发者暂时避免在 llama.cpp 中直接使用 IBM Granite 模型，除非愿意自行调试分词器相关代码。可以关注官方仓库和社区讨论，等待后续更新。若急需使用 Granite 模型，建议在官方支持的其他框架或环境中运行，或尝试自行调整 tokenizer 配置，结合社区反馈逐步解决兼容性问题。
+
+总结：IBM Granite 支持是一个有价值但尚未完成的功能，社区关注度较高，后续有望通过改进分词器和 GGUF 支持实现。开发者应密切关注官方动态，合理规划使用方案。",Issue #7116
+30,Issue驱动,Bug排查,Issue #2990,我遇到了这个问题：ValueError: Only GGJTv3 supported。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+用户在运行 `convert-llama-ggmlv3-to-gguf.py` 脚本时，出现了 `ValueError: Only GGJTv3 supported` 的异常，导致模型转换过程无法继续。
+
+2. **可能原因**  
+该错误表明脚本当前仅支持 GGML 格式的 v3 版本（GGJTv3）模型文件，而用户提供的模型文件格式版本不匹配。llama.cpp 中模型文件格式会随着版本迭代有所变动，脚本通过读取文件头信息来识别版本。如果文件头不符合预期的 GGJTv3 标识，脚本会主动抛出此错误以避免后续解析失败。
+
+3. **排查思路**  
+- 确认输入模型文件确实是 GGML v3 格式，而非其他版本（如 v1、v2 或非 GGML 格式）。  
+- 使用 `file` 命令或查看模型文件头部字节，确认文件版本标识。  
+- 检查是否误用其他框架导出的模型或损坏的文件。  
+- 确认使用的转换脚本版本是最新的，避免旧版脚本不支持新格式。  
+- 若模型来源不明，尝试重新下载或转换为支持的格式。
+
+4. **已知结论**  
+目前 `convert-llama-ggmlv3-to-gguf.py` 脚本明确只支持 GGML v3 格式模型，其他版本暂不兼容。解决方案是确保输入模型为 GGML v3 格式，或者等待后续脚本更新支持更多版本。若模型格式不符，需先转换或获取正确版本的模型文件。",Issue #2990
+31,Issue驱动,Feature需求,Issue #6803,llama.cpp 目前支持 Support for InternVL 吗？社区有没有相关的讨论或计划？,"关于“llama.cpp 是否支持 InternVL”这一需求，回答如下：
+
+1. **需求背景**  
+InternVL-Chat-V1.5 是近期发布的开源视觉语言模型，因其在多模态理解和生成任务中表现优异，且基准测试成绩领先，受到社区关注。用户希望通过 llama.cpp 这一轻量高效的推理框架，能够直接加载和运行该模型，实现视觉语言融合的应用场景，如多模态对话、图像理解辅助生成等。
+
+2. **当前状态**  
+截至目前，llama.cpp 主要聚焦于纯文本的 LLaMA 系列模型推理，尚未原生支持 InternVL 这类多模态模型。InternVL 结构中包含视觉编码器和跨模态融合模块，架构复杂度和依赖与 llama.cpp 现有代码基础存在较大差异，因此没有直接兼容方案。社区中暂时没有官方或成熟的第三方适配版本。
+
+3. **社区态度**  
+Issue #6803 中，部分核心开发者和用户表达了对 InternVL 潜力的认可，但也指出目前资源有限，且多模态模型的支持需要较大改动和额外依赖，短期内难以纳入主线。讨论更多集中在评估技术可行性和后续规划，尚无明确开发时间表。
+
+4. **使用建议**  
+如果您需要使用 InternVL，建议先采用官方或专门的多模态推理框架（如 PyTorch、TensorRT 等）进行实验和部署。关注 llama.cpp 的后续更新和社区贡献，未来可能会有轻量化适配方案出现。对于有能力的开发者，欢迎参与相关讨论和贡献代码，推动多模态支持的实现。
+
+总结：目前 llama.cpp 不支持 InternVL，社区认可其价值但尚无具体计划，建议使用专用框架并关注后续动态。",Issue #6803
+32,Issue驱动,性能问题,Issue #13765,llama.cpp 推理时遇到性能问题：vulkan prompt processing suddenly slows down once I reach a 。有什么优化建议？,"针对您反馈的 Vulkan 下 prompt 处理速度骤降问题，结合 Issue #13765 的分析，回复如下：
+
+1. **性能瓶颈**  
+该问题核心在于 prompt token 数量达到某个阈值后，Vulkan 资源管理和调度效率急剧下降，导致 prompt 处理阶段（尤其是前向计算和缓存管理）变慢。具体表现为显存分配碎片化和同步开销增加，影响了 prompt 的快速解析和上下文构建。
+
+2. **影响范围**  
+此问题主要出现在使用 RADV 驱动的 AMD GPU（如 FirePro W8100、RX 470）环境下，且在较大模型（如 Mistral Small 22B）且采用量化格式（Q4_K_M、Q4_K_S）以及全模型 offload（`-sm layer`）配置时更为明显。文本生成阶段性能正常，主要影响 prompt 预处理。
+
+3. **优化方向**  
+- 尽量避免 prompt token 数量超过临界值（约 200-385 token，依量化格式不同而异）。  
+- 关注 Vulkan 驱动和 RADV 版本更新，部分版本存在性能回退或资源管理问题。  
+- 尝试调整 offload 策略，如减少全模型 offload，或改用 CPU/GPU 混合计算。  
+- 未来版本可能会优化 Vulkan 缓存管理和同步机制，建议关注后续更新。
+
+4. **参考信息**  
+Issue 中提到 Mistral Small 22B 模型，Q4_K_M 量化格式下 prompt 达 385 token 后性能下降明显；Q4_K_S 格式则在 202 token 附近出现类似问题。该问题仅影响 prompt 处理速度，文本生成过程无明显性能问题。
+
+总结：该性能瓶颈主要由 Vulkan 资源管理在大 prompt 下的效率问题导致，受限于特定硬件和驱动环境。当前可通过控制 prompt 长度和调整 offload 配置缓解，后续版本会持续优化相关机制。",Issue #13765
+33,Issue驱动,Feature需求,Issue #11050,llama.cpp 目前支持 Add support for Kokoro TTS 吗？社区有没有相关的讨论或计划？,"关于“支持 Kokoro TTS”功能需求，以下是针对该问题的专业分析：
+
+1. **需求背景**  
+Kokoro TTS 因其小巧模型体积和自然的语音表现，尤其在口音和语调方面表现出色，受到不少开发者关注。用户希望能在 CPU 或边缘设备上高效部署，满足语音合成的轻量化和实时性需求。
+
+2. **当前状态**  
+截至目前，llama.cpp 主要聚焦于 LLaMA 系列语言模型的推理优化和部署，尚未原生支持任何 TTS（文本转语音）模型，包括 Kokoro TTS。llama.cpp 的架构和算子设计针对语言模型，缺少音频生成相关的模块，因此无法直接加载和运行 Kokoro TTS 模型。
+
+3. **社区态度**  
+从 Issue #11050 的讨论来看，社区对 Kokoro TTS 的兴趣较高，认可其性能优势，但也明确指出需要专门针对 TTS 的推理框架支持。目前尚无官方计划将 Kokoro TTS 集成到 llama.cpp，更多是希望能有第三方或社区贡献相关支持。
+
+4. **使用建议**  
+如果目标是部署 Kokoro TTS，建议使用专门的 TTS 推理框架或工具（如 TensorFlow Lite、ONNX Runtime 等），这些框架对音频生成有更完善的支持。对于希望在边缘设备上运行的开发者，可以关注 Kokoro TTS 官方或社区是否提供轻量化模型和推理方案。同时，llama.cpp 用户可关注社区动态，未来若有跨模态支持需求，可能会有相关扩展出现。
+
+总结：llama.cpp 目前不支持 Kokoro TTS，建议使用专门的 TTS 框架进行部署，社区对此功能有兴趣但暂无明确开发计划。",Issue #11050
+34,Issue驱动,Bug排查,Issue #10439,我遇到了这个问题：Flash Attention performs worse under ROCM。有人遇到过类似的情况吗？可能的原因和解决方向是什么？,"1. **症状描述**  
+在 ROCm 平台（如 AMD 7900 XTX）上启用 Flash Attention 后，模型推理性能反而下降，尤其在多批次（batch size 16）并发请求时，prompt 处理和 token 生成速度明显变慢，性能劣化远超单批次场景。
+
+2. **可能原因**  
+llama.cpp 中 Flash Attention 依赖底层高效的 GPU 内存访问和并行计算特性。ROCm 对比 CUDA 在内核调度、内存带宽利用、同步机制等方面存在差异，可能导致 Flash Attention 的内核调用效率低下。此外，ROCm 对某些张量操作的优化不如 CUDA 完善，批量并发时资源竞争加剧，进一步影响性能。
+
+3. **排查思路**  
+- 通过 ROCm 自带的性能分析工具（如 rocprof）监测内核执行时间和资源利用率，确认瓶颈所在。  
+- 对比开启和关闭 Flash Attention 的内核调用情况，定位是否是特定内核性能退化。  
+- 简化测试场景，逐步增加 batch size，观察性能变化趋势。  
+- 检查是否存在内存访问不对齐、同步等待等低效操作。  
+- 参考 ROCm 社区和驱动更新，确认是否为平台驱动或库版本问题。
+
+4. **已知结论**  
+目前 Issue 中尚无明确修复方案，Flash Attention 在 ROCm 下性能下降被确认，但具体优化仍需深入调试。短期内建议在 ROCm 环境下根据实际需求权衡是否启用 Flash Attention，或尝试使用非 Flash Attention 模式以避免性能下降。未来可能需要针对 ROCm 进行专门的内核优化或等待驱动改进。",Issue #10439
+35,Issue驱动,Bug修复链路,Issue #20002,我在使用 llama.cpp 时遇到了类似的问题：Qwen3.5-35b-a3b unloads automatically with no errors。可能是什么原因导致的？应该怎么排查？,"1. **问题症状**  
+用户在使用 Qwen3.5-35b-a3b 模型时，程序会无预警自动退出且无任何错误日志，最后一条日志通常是“load:  - found better prompt with f_keep”。该现象在使用特定参数组合（如高线程数、并行等）及特定模型量化格式时更为频繁。
+
+2. **根本原因**  
+该问题主要源于模型加载和推理过程中内存管理或多线程调度异常，尤其是在并行执行和量化格式转换（如 q8_0）时，部分缓存或上下文状态未正确同步或释放，导致程序在无异常捕获的情况下崩溃退出。此外，推理流程中的提示词缓存机制（f_keep）在特定条件下可能触发未定义行为。
+
+3. **修复思路**  
+排查应重点关注多线程并行执行时的资源竞争和内存访问安全，特别是模型权重加载、量化转换及提示词缓存的生命周期管理。建议通过增加日志打印、开启调试断点和内存检测工具（如ASAN）定位崩溃点。同时，验证各线程间状态同步和锁机制是否完善，确保资源释放和状态更新的原子性。
+
+4. **修复方案**  
+已有 PR 通过优化模型加载流程和提示词缓存管理解决了该问题。具体包括：修正了多线程环境下缓存状态的同步逻辑，避免了因并行访问导致的资源冲突；改进了量化格式转换的边界检查，防止非法内存访问；并增强了错误捕获和日志输出，确保异常能被及时发现和处理。该方案显著提升了模型稳定性，避免了无错误日志的自动退出。","Issue #20002, PR #20132"
+36,Issue驱动,Bug修复链路,Issue #19394,llama.cpp 中出现了这个问题：forcing full prompt re-processing in Qwen3-Coder-Next。这是什么原因？社区是怎么解决的？,"1. **问题症状**  
+在使用 Qwen3-Coder-Next 模型时，llama.cpp 会频繁触发“forcing full prompt re-processing due to lack of cache data”的警告，导致每次推理都必须重新处理整个提示词（prompt），显著增加计算时间，严重影响模型的响应速度和实用性。
+
+2. **根本原因**  
+该问题主要源于模型的缓存机制与 Qwen3-Coder-Next 模型的架构不兼容。具体来说，Qwen3-Coder-Next 采用了混合或递归记忆（hybrid/recurrent memory）机制，导致缓存状态无法正确保存或恢复，缓存数据缺失，触发了强制重新处理整个提示的逻辑。
+
+3. **修复思路**  
+排查应聚焦于缓存管理模块，尤其是针对 Qwen3-Coder-Next 模型的缓存状态保存与恢复逻辑。需要确认缓存结构是否与模型的记忆机制匹配，检查缓存索引、状态序列和模型输入输出的同步情况，确保缓存数据完整且能正确复用。
+
+4. **修复方案**  
+社区通过 PR 修复了缓存状态管理的兼容性问题，改进了缓存数据的保存与恢复流程，特别是针对 Qwen3-Coder-Next 的混合记忆机制做了适配。修复后，缓存数据能够正确保持，避免了重复全量提示处理，大幅提升了推理效率和用户体验。具体改动包括调整缓存索引逻辑和完善状态序列同步机制。","Issue #19394, PR #19408"
+37,Issue驱动,Feature需求,Issue #3051,llama.cpp 目前支持 Multi-GPU support for AMD? 吗？社区有没有相关的讨论或计划？,"关于“llama.cpp 是否支持 AMD 多GPU”的需求，简要说明如下：
+
+1. **需求背景**  
+多GPU支持主要针对需要大规模模型推理或训练的场景，尤其是显存受限时，通过多卡并行能显著提升性能和处理更大模型。对于使用AMD显卡的用户，若能实现多GPU并行，将极大增强 llama.cpp 在非NVIDIA硬件上的适用性和扩展能力。
+
+2. **当前状态**  
+截至目前，llama.cpp 原生并未提供对 AMD 多GPU 的直接支持。项目主要依赖 CPU 和单卡 GPU（NVIDIA CUDA）加速，AMD GPU 的支持相对有限。社区中已有部分基于 ROCm 或 OpenCL 的尝试，但尚未形成官方稳定方案。多GPU多卡并行功能主要集中在 NVIDIA CUDA 生态中。
+
+3. **社区态度**  
+Issue #3051 中，开发者和用户普遍认可多GPU支持的价值，但由于技术复杂度和资源限制，目前尚无明确的官方开发计划。讨论多集中在技术可行性和优先级评估上，社区欢迎贡献相关实现，但整体进展较缓慢。
+
+4. **使用建议**  
+对于需要多GPU加速的 AMD 用户，建议关注社区相关讨论和第三方项目，或考虑使用多节点 CPU 并行方案作为替代。同时，若具备相关技术能力，欢迎贡献基于 ROCm 的多GPU支持。短期内，推荐优先使用单卡或 CPU 模式，结合模型量化等技术优化性能。
+
+总结：AMD 多GPU支持是合理且有需求的功能，但目前 llama.cpp 尚未实现，社区对此持开放态度但进展有限。用户应根据自身硬件环境权衡使用方案，关注后续更新。",Issue #3051
+38,代码理解,Purpose,common_log_main,函数 common_log_main 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,common_log_main 定义在 common/log.cpp，被 92 个函数调用，是系统基础设施。 Provide a singleton instance of the common_log structure with color support initialized once.,common/log.cpp
+39,代码理解,Purpose,operator+,函数 operator+ 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,operator+ 定义在 common/peg-parser.cpp，被 26 个函数调用，是系统基础设施。 Concatenate a C-string literal with a common_peg_parser object to produce a new parser.,common/peg-parser.cpp
+40,代码理解,Architecture,test-backend-ops.cpp,tests/test-backend-ops.cpp 这个文件的职责是什么？包含哪些核心函数？,"tests/test-backend-ops.cpp 包含 572 个函数，核心函数包括：init_tensor_uniform, init_tensor_kq_mask, init_tensor_tril, tensor_to_float, nmse, jdst, mean_abs_asymm, var_to_str。总 fan_in=14，fan_out=54。",tests/test-backend-ops.cpp
+41,代码理解,Architecture,ggml.c,ggml/src/ggml.c 这个文件的职责是什么？包含哪些核心函数？,"ggml/src/ggml.c 包含 433 个函数，核心函数包括：ggml_print_backtrace_symbols, ggml_print_backtrace, ggml_set_abort_callback, ggml_abort, ggml_log_internal_v, ggml_log_internal, ggml_log_callback_default, ggml_aligned_malloc。总 fan_in=1241，fan_out=211。",ggml/src/ggml.c
+42,代码理解,Architecture,llama-sampler.cpp,src/llama-sampler.cpp 这个文件的职责是什么？包含哪些核心函数？,"src/llama-sampler.cpp 包含 190 个函数，核心函数包括：ring_buffer, front, front, back, back, push_back, pop_front, rat。总 fan_in=160，fan_out=173。",src/llama-sampler.cpp
+43,代码理解,Purpose,ggml_view_tensor,函数 ggml_view_tensor 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,ggml_view_tensor 定义在 ggml/src/ggml.c，被 30 个函数调用，是系统基础设施。 Create a tensor view that shares data layout and metadata with the source tensor without copying data.,ggml/src/ggml.c
+44,代码理解,Purpose,ggml_abort,函数 ggml_abort 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,"ggml_abort 定义在 ggml/src/ggml.c，被 345 个函数调用，是系统基础设施。 Abort execution with an error message including file and line information, optionally invoking a custom callback or printing a backtrace.",ggml/src/ggml.c
+45,代码理解,Dependency,llama_adapter_lora_init_impl -> gguf_get_val_f32,src/llama-adapter.cpp 中的 llama_adapter_lora_init_impl 为什么依赖 ggml/src/gguf.cpp 中的 gguf_get_val_f32？这两个文件之间是什么关系？,llama_adapter_lora_init_impl 跨文件调用了 gguf_get_val_f32，说明这两个模块存在耦合。 调用者功能：Load and initialize a LoRA adapter from a file into the given model and adapter structures. 被调用者功能：Retrieve a single float value from the key-value store at the specified key index.,"src/llama-adapter.cpp, ggml/src/gguf.cpp"
+46,代码理解,Data/Control Flow,build_attn_inp_kv_impl -> ggml_set_input,函数 build_attn_inp_kv_impl 为什么要调用 ggml_set_input？这两个函数之间是什么关系？,build_attn_inp_kv_impl（src/llama-graph.cpp）调用了 ggml_set_input（ggml/src/ggml.c）。 调用者：Constructs and initializes attention key-value input tensors and masks for the language model graph. 被调用者：Marks a tensor as an input tensor by setting the input flag.,"src/llama-graph.cpp, ggml/src/ggml.c"
+47,代码理解,Purpose,ggml_nbytes,函数 ggml_nbytes 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,ggml_nbytes 定义在 ggml/src/ggml.c，被 29 个函数调用，是系统基础设施。 Calculate the total number of bytes occupied by the given tensor.,ggml/src/ggml.c
+48,代码理解,Dependency,llama_adapter_lora_init_impl -> replace_all,src/llama-adapter.cpp 中的 llama_adapter_lora_init_impl 为什么依赖 src/llama-impl.cpp 中的 replace_all？这两个文件之间是什么关系？,llama_adapter_lora_init_impl 跨文件调用了 replace_all，说明这两个模块存在耦合。 调用者功能：Load and initialize a LoRA adapter from a file into the given model and adapter structures. 被调用者功能：Replace all occurrences of a substring within a string with another substring.,"src/llama-adapter.cpp, src/llama-impl.cpp"
+49,代码理解,Purpose,common_log_add,函数 common_log_add 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,common_log_add 定义在 common/log.cpp，被 91 个函数调用，是系统基础设施。 Adds a formatted log entry to the common log with a specified log level.,common/log.cpp
+50,代码理解,Dependency,quantize_row_q2_K_impl -> ggml_abort,ggml/src/ggml-quants.c 中的 quantize_row_q2_K_impl 为什么依赖 ggml/src/ggml.c 中的 ggml_abort？这两个文件之间是什么关系？,"quantize_row_q2_K_impl 跨文件调用了 ggml_abort，说明这两个模块存在耦合。 调用者功能：Quantizes a block of floating-point values into the q2_K format using provided quantization weights. 被调用者功能：Abort execution with an error message including file and line information, optionally invoking a custom callback or printing a backtrace.","ggml/src/ggml-quants.c, ggml/src/ggml.c"
+51,代码理解,Architecture,httplib.cpp,vendor/cpp-httplib/httplib.cpp 这个文件的职责是什么？包含哪些核心函数？,"vendor/cpp-httplib/httplib.cpp 包含 924 个函数，核心函数包括：Result::Result, Result::Result, Result::Result, Result::operator=, Result::is_valid, Result::operator bool, Result::status, Result::headers。总 fan_in=13，fan_out=13。",vendor/cpp-httplib/httplib.cpp
+52,代码理解,Data/Control Flow,quantize_row_q2_K_impl -> ggml_abort,函数 quantize_row_q2_K_impl 为什么要调用 ggml_abort？这两个函数之间是什么关系？,"quantize_row_q2_K_impl（ggml/src/ggml-quants.c）调用了 ggml_abort（ggml/src/ggml.c）。 调用者：Quantizes a block of floating-point values into the q2_K format using provided quantization weights. 被调用者：Abort execution with an error message including file and line information, optionally invoking a custom callback or printing a backtrace.","ggml/src/ggml-quants.c, ggml/src/ggml.c"
+53,代码理解,Design Rationale,ggml_acc_impl,函数 ggml_acc_impl 既被 2 个函数调用，又调用了 5 个函数。它在系统中处于什么层级？设计意图是什么？,ggml_acc_impl（ggml/src/ggml.c）是一个中间层函数，fan_in=2，fan_out=5，起到承上启下的作用。 Create a new tensor representing the accumulation of two tensors with optional in-place modification and offset parameters.,ggml/src/ggml.c
+54,代码理解,Data/Control Flow,getter -> gguf_get_arr_type,函数 getter 为什么要调用 gguf_get_arr_type？这两个函数之间是什么关系？,getter（src/llama-model-loader.cpp）调用了 gguf_get_arr_type（ggml/src/gguf.cpp）。 调用者：Retrieve array metadata and associated data pointer from a gguf context at a specified index. 被调用者：Retrieve the type of an array value from a key-value context using a key identifier.,"src/llama-model-loader.cpp, ggml/src/gguf.cpp"
+55,代码理解,Purpose,ggml_nrows,函数 ggml_nrows 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,"ggml_nrows 定义在 ggml/src/ggml.c，被 62 个函数调用，是系统基础设施。 Compute the number of rows in a 4-dimensional tensor by multiplying dimensions 1, 2, and 3.",ggml/src/ggml.c
+56,代码理解,Data/Control Flow,llama_tensor_dequantize_impl -> ggml_type_size,函数 llama_tensor_dequantize_impl 为什么要调用 ggml_type_size？这两个函数之间是什么关系？,"llama_tensor_dequantize_impl（src/llama-quant.cpp）调用了 ggml_type_size（ggml/src/ggml.c）。 调用者：Dequantizes or converts a tensor's data to 32-bit float values, optionally using multithreading for performance. 被调用者：Return the size in bytes of a specified GGML data type.","src/llama-quant.cpp, ggml/src/ggml.c"
+57,代码理解,Data/Control Flow,llama_adapter_lora_init_impl -> replace_all,函数 llama_adapter_lora_init_impl 为什么要调用 replace_all？这两个函数之间是什么关系？,llama_adapter_lora_init_impl（src/llama-adapter.cpp）调用了 replace_all（src/llama-impl.cpp）。 调用者：Load and initialize a LoRA adapter from a file into the given model and adapter structures. 被调用者：Replace all occurrences of a substring within a string with another substring.,"src/llama-adapter.cpp, src/llama-impl.cpp"
+58,代码理解,Design Rationale,llama_sampler_backend_support,函数 llama_sampler_backend_support 既被 7 个函数调用，又调用了 12 个函数。它在系统中处于什么层级？设计意图是什么？,llama_sampler_backend_support（src/llama-sampler.cpp）是一个中间层函数，fan_in=7，fan_out=12，起到承上启下的作用。 Checks if the given sampler supports the specified backend buffer type by verifying device capabilities and required operations.,src/llama-sampler.cpp
+59,代码理解,Design Rationale,ggml_new_tensor_impl,函数 ggml_new_tensor_impl 既被 2 个函数调用，又调用了 6 个函数。它在系统中处于什么层级？设计意图是什么？,"ggml_new_tensor_impl（ggml/src/ggml.c）是一个中间层函数，fan_in=2，fan_out=6，起到承上启下的作用。 Allocate and initialize a new tensor within the given context, optionally as a view on an existing tensor.",ggml/src/ggml.c
+60,代码理解,Purpose,ggml_nelements,函数 ggml_nelements 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,ggml_nelements 定义在 ggml/src/ggml.c，被 31 个函数调用，是系统基础设施。 Calculate the total number of elements in a tensor.,ggml/src/ggml.c
+61,代码理解,Architecture,ops.cpp,ggml/src/ggml-cpu/ops.cpp 这个文件的职责是什么？包含哪些核心函数？,"ggml/src/ggml-cpu/ops.cpp 包含 215 个函数，核心函数包括：ggml_compute_forward_dup_same_cont, ggml_compute_forward_dup_flt, ggml_compute_forward_dup_to_q, ggml_compute_forward_dup_bytes, ggml_compute_forward_dup_from_q, ggml_compute_forward_dup, ggml_compute_forward_add_q_f32, ggml_compute_forward_add。总 fan_in=113，fan_out=351。",ggml/src/ggml-cpu/ops.cpp
+62,代码理解,Data/Control Flow,gguf_kv_to_str -> gguf_get_val_str,函数 gguf_kv_to_str 为什么要调用 gguf_get_val_str？这两个函数之间是什么关系？,gguf_kv_to_str（src/llama-impl.cpp）调用了 gguf_get_val_str（ggml/src/gguf.cpp）。 调用者：Convert a key-value entry from a GGUF context to its string representation. 被调用者：Retrieve a string value from the key-value context by key ID.,"src/llama-impl.cpp, ggml/src/gguf.cpp"
+63,代码理解,Architecture,llama-context.cpp,src/llama-context.cpp 这个文件的职责是什么？包含哪些核心函数？,"src/llama-context.cpp 包含 172 个函数，核心函数包括：llama_context::llama_context, llama_context::~llama_context, llama_context::sched_reserve, llama_context::synchronize, llama_context::get_model, llama_context::get_cparams, llama_context::get_sched, llama_context::n_ctx。总 fan_in=124，fan_out=4。",src/llama-context.cpp
+64,代码理解,Purpose,ggml_are_same_shape,函数 ggml_are_same_shape 在 llama.cpp 中扮演什么角色？为什么有这么多地方调用它？,ggml_are_same_shape 定义在 ggml/src/ggml.c，被 30 个函数调用，是系统基础设施。 Check if two tensors have the same shape across all dimensions.,ggml/src/ggml.c
+65,代码理解,Architecture,repack.cpp,ggml/src/ggml-cpu/repack.cpp 这个文件的职责是什么？包含哪些核心函数？,"ggml/src/ggml-cpu/repack.cpp 包含 135 个函数，核心函数包括：nearest_int, ggml_quantize_mat_q8_0_4x4, ggml_quantize_mat_q8_0_4x8_generic, ggml_quantize_mat_q8_K_4x4, ggml_quantize_mat_q8_K_4x8_generic, ggml_quantize_mat_t, ggml_quantize_mat_t<4, GGML_TYPE_Q8_0>, ggml_quantize_mat_t<8, GGML_TYPE_Q8_0>。总 fan_in=32，fan_out=83。",ggml/src/ggml-cpu/repack.cpp
+66,代码理解,Architecture,llama-vocab.cpp,src/llama-vocab.cpp 这个文件的职责是什么？包含哪些核心函数？,"src/llama-vocab.cpp 包含 210 个函数，核心函数包括：naive_trie, insert, get_longest_prefix, traverse, llm_tokenizer, ~llm_tokenizer, operator(), llm_tokenizer_spm。总 fan_in=66，fan_out=23。",src/llama-vocab.cpp
+67,代码理解,Data/Control Flow,impl -> llama_log_internal,函数 impl 为什么要调用 llama_log_internal？这两个函数之间是什么关系？,impl（src/llama-mmap.cpp）调用了 llama_log_internal（src/llama-impl.cpp）。 调用者：Initialize file access by opening the file with optional direct I/O and fallback to buffered I/O. 被调用者：Formats and forwards log messages with a specified log level using variable arguments.,"src/llama-mmap.cpp, src/llama-impl.cpp"
+68,工作流,影响分析,ggml_build_forward_expand,我想修改函数 ggml_build_forward_expand，这样做的风险有多大？会影响哪些上游调用者？,ggml_build_forward_expand（ggml/src/ggml.c）被 22 个函数调用，修改风险较高。 功能：Builds the forward pass for an 'expand' operation in the computation graph. 建议修改前做充分的回归测试。,ggml/src/ggml.c
+69,工作流,依赖风险,llama_adapter_lora_init_impl -> replace_all,src/llama-adapter.cpp 依赖了 src/llama-impl.cpp，这个跨模块依赖合理吗？如果后者接口变了，影响范围多大？,llama_adapter_lora_init_impl（src/llama-adapter.cpp）调用了 replace_all（src/llama-impl.cpp），存在跨模块耦合。 被依赖函数功能：Replace all occurrences of a substring within a string with another substring. 如果被依赖接口变更，需要同步更新调用方。,"src/llama-adapter.cpp, src/llama-impl.cpp"
+70,工作流,影响分析,ggml_add,我想修改函数 ggml_add，这样做的风险有多大？会影响哪些上游调用者？,ggml_add（ggml/src/ggml.c）被 23 个函数调用，修改风险较高。 功能：Compute the element-wise addition of two tensors. 建议修改前做充分的回归测试。,ggml/src/ggml.c
+71,工作流,复杂度评估,test_regression,函数 test_regression 调用了 23 个子函数，复杂度很高。有什么重构建议？,test_regression（tests/test-opt.cpp）fan_out=23，是系统中最复杂的函数之一。 功能：Performs a regression test to fit a simple linear model and verifies learned parameters. 建议考虑按职责拆分为多个子函数，降低认知复杂度。,tests/test-opt.cpp
+72,工作流,Code Review,parser.cpp,我在 review common/jinja/parser.cpp 的代码，parse_jinja_statement 和 is_type 之间的调用关系合理吗？这个文件的内聚性如何？,在 common/jinja/parser.cpp 中，parse_jinja_statement（fan_out=3）调用了 is_type（fan_in=1）。 parse_jinja_statement：Parses Jinja template statements starting with {% and dispatches to specific statement parsers based on keyword. is_type：Check if a statement pointer points to a specific type T.,common/jinja/parser.cpp
+73,工作流,影响分析,nearest_int,我想修改函数 nearest_int，这样做的风险有多大？会影响哪些上游调用者？,nearest_int（ggml/src/ggml-quants.c）被 19 个函数调用，修改风险较高。 功能：Convert a float to its nearest integer representation using bit manipulation. 建议修改前做充分的回归测试。,ggml/src/ggml-quants.c
+74,工作流,依赖风险,quantize_row_q2_K_impl -> ggml_abort,ggml/src/ggml-quants.c 依赖了 ggml/src/ggml.c，这个跨模块依赖合理吗？如果后者接口变了，影响范围多大？,"quantize_row_q2_K_impl（ggml/src/ggml-quants.c）调用了 ggml_abort（ggml/src/ggml.c），存在跨模块耦合。 被依赖函数功能：Abort execution with an error message including file and line information, optionally invoking a custom callback or printing a backtrace. 如果被依赖接口变更，需要同步更新调用方。","ggml/src/ggml-quants.c, ggml/src/ggml.c"
+75,工作流,复杂度评估,helper_get_ctx_data,函数 helper_get_ctx_data 调用了 20 个子函数，复杂度很高。有什么重构建议？,helper_get_ctx_data（tests/test-opt.cpp）fan_out=20，是系统中最复杂的函数之一。 功能：Prepare and initialize context data structures and tensors for optimization tests. 建议考虑按职责拆分为多个子函数，降低认知复杂度。,tests/test-opt.cpp
+76,工作流,Code Review,arg.cpp,我在 review common/arg.cpp 的代码，common_params_parse_ex 和 common_params_handle_remote_preset 之间的调用关系合理吗？这个文件的内聚性如何？,在 common/arg.cpp 中，common_params_parse_ex（fan_out=8）调用了 common_params_handle_remote_preset（fan_in=1）。 common_params_parse_ex：Parse and process command line arguments and environment variables to populate common parameters context. common_params_handle_remote_preset：Fetches and applies a remote preset configuration based on a model repository and tag.,common/arg.cpp
+77,工作流,复杂度评估,test_multiple_buffer_types,函数 test_multiple_buffer_types 调用了 21 个子函数，复杂度很高。有什么重构建议？,test_multiple_buffer_types（tests/test-alloc.cpp）fan_out=21，是系统中最复杂的函数之一。 功能：Tests memory allocation and handling of multiple buffer types across different backends in a computation graph. 建议考虑按职责拆分为多个子函数，降低认知复杂度。,tests/test-alloc.cpp
+78,工作流,复杂度评估,diffusion_generate,函数 diffusion_generate 调用了 21 个子函数，复杂度很高。有什么重构建议？,diffusion_generate（examples/diffusion/diffusion-cli.cpp）fan_out=21，是系统中最复杂的函数之一。 功能：Generates tokens for diffusion-based sampling using iterative masking and token replacement in a llama model context. 建议考虑按职责拆分为多个子函数，降低认知复杂度。,examples/diffusion/diffusion-cli.cpp
+79,工作流,影响分析,test_template,我想修改函数 test_template，这样做的风险有多大？会影响哪些上游调用者？,test_template（tests/test-jinja.cpp）被 18 个函数调用，修改风险较高。 功能：Executes and verifies template rendering against expected output using provided variables. 建议修改前做充分的回归测试。,tests/test-jinja.cpp
+80,工作流,影响分析,ggml_type_size,我想修改函数 ggml_type_size，这样做的风险有多大？会影响哪些上游调用者？,ggml_type_size（ggml/src/ggml.c）被 26 个函数调用，修改风险较高。 功能：Return the size in bytes of a specified GGML data type. 建议修改前做充分的回归测试。,ggml/src/ggml.c
+81,工作流,Code Review,console.cpp,我在 review common/console.cpp 的代码，readline_advanced 和 getchar32 之间的调用关系合理吗？这个文件的内聚性如何？,"在 common/console.cpp 中，readline_advanced（fan_out=8）调用了 getchar32（fan_in=1）。 readline_advanced：Reads a line of user input from the console with advanced editing and history support. getchar32：Reads a single Unicode character from standard input, handling surrogate pairs and special keys.",common/console.cpp
+82,工作流,影响分析,llama_sampler_init_dist,我想修改函数 llama_sampler_init_dist，这样做的风险有多大？会影响哪些上游调用者？,llama_sampler_init_dist（src/llama-sampler.cpp）被 21 个函数调用，修改风险较高。 功能：Initialize a llama_sampler instance with a distribution-based sampling interface and seeded random number generator. 建议修改前做充分的回归测试。,src/llama-sampler.cpp
+83,工作流,Code Review,download.cpp,我在 review common/download.cpp 的代码，write_etag 和 write_file 之间的调用关系合理吗？这个文件的内聚性如何？,在 common/download.cpp 中，write_etag（fan_out=3）调用了 write_file（fan_in=1）。 write_etag：Save the given etag string to a file with '.etag' appended to the original path. write_file：Atomically writes content to a file by writing to a temporary file and renaming it.,common/download.cpp
+84,工作流,改动热点,common_chat_templates_get_caps,函数 common_chat_templates_get_caps 最近被频繁修改，是不是设计有问题？历史上改它容易出什么问题？,common_chat_templates_get_caps（common/chat.cpp）被 4 个 PR 修改过。最近的 PR 包括：common : rework gpt-oss parser; common/parser: add proper reasoning tag prefill reading; chat : fix out_of_range crash in throw path (#20424 regression)。 功能：Retrieve the capabilities map from the default chat template.,common/chat.cpp
+85,工作流,影响分析,llama_model_get_vocab,我想修改函数 llama_model_get_vocab，这样做的风险有多大？会影响哪些上游调用者？,llama_model_get_vocab（src/llama-model.cpp）被 24 个函数调用，修改风险较高。 功能：Retrieve the vocabulary associated with a given llama model. 建议修改前做充分的回归测试。,src/llama-model.cpp
+86,工作流,依赖风险,llama_adapter_lora_init_impl -> seek,src/llama-adapter.cpp 依赖了 src/llama-mmap.cpp，这个跨模块依赖合理吗？如果后者接口变了，影响范围多大？,llama_adapter_lora_init_impl（src/llama-adapter.cpp）调用了 seek（src/llama-mmap.cpp），存在跨模块耦合。 被依赖函数功能：Adjust the file or stream position to the specified offset according to whence. 如果被依赖接口变更，需要同步更新调用方。,"src/llama-adapter.cpp, src/llama-mmap.cpp"
+87,工作流,影响分析,ggml_barrier,我想修改函数 ggml_barrier，这样做的风险有多大？会影响哪些上游调用者？,ggml_barrier（ggml/src/ggml-cpu/ggml-cpu.c）被 20 个函数调用，修改风险较高。 功能：Synchronize threads in a thread pool to wait until all have reached the barrier point. 建议修改前做充分的回归测试。,ggml/src/ggml-cpu/ggml-cpu.c
+88,工作流,改动热点,operator<<,函数 operator<< 最近被频繁修改，是不是设计有问题？历史上改它容易出什么问题？,operator<<（tests/test-chat.cpp）被 4 个 PR 修改过。最近的 PR 包括：common : rework gpt-oss parser; common/parser: add proper reasoning tag prefill reading; chat : fix out_of_range crash in throw path (#20424 regression)。 功能：Serialize common_chat_msg object to an output stream in a structured format.,tests/test-chat.cpp
+89,工作流,依赖风险,llama_adapter_lora_init_impl -> gguf_get_val_f32,src/llama-adapter.cpp 依赖了 ggml/src/gguf.cpp，这个跨模块依赖合理吗？如果后者接口变了，影响范围多大？,llama_adapter_lora_init_impl（src/llama-adapter.cpp）调用了 gguf_get_val_f32（ggml/src/gguf.cpp），存在跨模块耦合。 被依赖函数功能：Retrieve a single float value from the key-value store at the specified key index. 如果被依赖接口变更，需要同步更新调用方。,"src/llama-adapter.cpp, ggml/src/gguf.cpp"
+90,工作流,Code Review,common.cpp,我在 review common/common.cpp 的代码，is_running_on_efficiency_core 和 cpuid 之间的调用关系合理吗？这个文件的内聚性如何？,在 common/common.cpp 中，is_running_on_efficiency_core（fan_out=1）调用了 cpuid（fan_in=2）。 is_running_on_efficiency_core：Determine if the current CPU core is an Intel efficiency core based on CPUID data. cpuid：Execute the CPUID instruction to retrieve CPU feature information.,common/common.cpp
+91,工作流,影响分析,llama_get_model,我想修改函数 llama_get_model，这样做的风险有多大？会影响哪些上游调用者？,llama_get_model（src/llama-context.cpp）被 19 个函数调用，修改风险较高。 功能：Retrieve a pointer to the model associated with the given context. 建议修改前做充分的回归测试。,src/llama-context.cpp
+92,工作流,Code Review,chat.cpp,我在 review common/chat.cpp 的代码，common_chat_templates_apply_jinja 和 common_chat_params_init_ministral_3 之间的调用关系合理吗？这个文件的内聚性如何？,"在 common/chat.cpp 中，common_chat_templates_apply_jinja（fan_out=8）调用了 common_chat_params_init_ministral_3（fan_in=1）。 common_chat_templates_apply_jinja：Processes chat templates with inputs to generate parameters for chat rendering, applying special cases and fallbacks. common_chat_params_init_ministral_3：Initialize chat parameters for the Ministral 3 model by formatting input messages, constructing a PEG parser, and setting up grammar rules.",common/chat.cpp
+93,工作流,模块稳定性,vulkan,llama.cpp 的 vulkan 模块最近稳定吗？有没有频繁出 bug 的趋势？,"vulkan 模块最近有 3 个已修复的 bug：Issue #17628, #19955, #19420，对应修复 PR #20672, #20296, #20059。","#17628, #19955, #19420, #20672, #20296, #20059"
+94,工作流,改动热点,common_chat_msg::to_json_oaicompat,函数 common_chat_msg::to_json_oaicompat 最近被频繁修改，是不是设计有问题？历史上改它容易出什么问题？,common_chat_msg::to_json_oaicompat（common/chat.cpp）被 4 个 PR 修改过。最近的 PR 包括：common : rework gpt-oss parser; common/parser: add proper reasoning tag prefill reading; chat : fix out_of_range crash in throw path (#20424 regression)。 功能：Convert a common_chat_msg object into a JSON representation compatible with OpenAI's chat format.,common/chat.cpp
+95,工作流,改动热点,message_with_reasoning_content_and_multiple_tool_calls,函数 message_with_reasoning_content_and_multiple_tool_calls 最近被频繁修改，是不是设计有问题？历史上改它容易出什么问题？,"message_with_reasoning_content_and_multiple_tool_calls（tests/test-chat.cpp）被 4 个 PR 修改过。最近的 PR 包括：common : rework gpt-oss parser; common/parser: add proper reasoning tag prefill reading; chat : fix out_of_range crash in throw path (#20424 regression)。 功能：Construct a chat message with reasoning, content, and multiple tool call entries.",tests/test-chat.cpp
+96,工作流,改动热点,message_with_tool_calls_and_reasoning,函数 message_with_tool_calls_and_reasoning 最近被频繁修改，是不是设计有问题？历史上改它容易出什么问题？,message_with_tool_calls_and_reasoning（tests/test-chat.cpp）被 4 个 PR 修改过。最近的 PR 包括：common : rework gpt-oss parser; common/parser: add proper reasoning tag prefill reading; chat : fix out_of_range crash in throw path (#20424 regression)。 功能：Construct a chat message encapsulating a tool call with its arguments and reasoning.,tests/test-chat.cpp
+97,工作流,模块稳定性,server,llama.cpp 的 server 模块最近稳定吗？有没有频繁出 bug 的趋势？,"server 模块最近有 3 个已修复的 bug：Issue #19690, #19513, #19394，对应修复 PR #19849, #19773, #19408。","#19690, #19513, #19394, #19849, #19773, #19408"

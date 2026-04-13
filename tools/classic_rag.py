@@ -42,56 +42,60 @@ def build_chunks(driver) -> list[dict]:
     chunks = []
 
     with driver.session(database=NEO4J_DATABASE) as s:
+        # 获取所有函数（无论是否有 annotation_json）
         r = s.run("""
             MATCH (f:Function)
-            WHERE f.annotation_json IS NOT NULL AND f.file_path IS NOT NULL
-            RETURN f.name AS name, f.file_path AS file, f.fan_in AS fan_in,
-                   f.fan_out AS fan_out, f.annotation_json AS ann
+            WHERE f.file_path IS NOT NULL
+            RETURN f.name AS name, f.file_path AS file,
+                   f.signature AS signature, f.start_line AS start_line
         """)
         for rec in r:
-            ann = rec.get("ann") or {}
-            if isinstance(ann, str):
-                import json as _json
-                ann = _json.loads(ann)
-            summary = ann.get("summary", "") if isinstance(ann, dict) else ""
-            workflow = ann.get("workflow_role", "") if isinstance(ann, dict) else ""
+            sig = rec.get("signature") or ""
             text = (f"函数: {rec['name']}\n文件: {rec['file']}\n"
-                    f"fan_in={rec['fan_in']} fan_out={rec['fan_out']}\n"
-                    f"描述: {summary}\n工作流角色: {workflow}")
+                    f"签名: {sig}")
             chunks.append({
-                "id": f"func::{rec['name']}::{rec['file']}",
+                "id": f"func::{rec['name']}::{rec['file']}:{rec['start_line']}",
                 "type": "function",
                 "text": text[:CHUNK_MAX],
                 "meta": {"name": rec["name"], "file": rec["file"]},
             })
 
-        r = s.run("""
-            MATCH (i:Issue)
-            RETURN i.number AS num, i.title AS title, i.body AS body
-        """)
-        for rec in r:
-            body = (rec.get("body") or "")[:300]
-            text = f"Issue #{rec['num']}: {rec['title']}\n{body}"
-            chunks.append({
-                "id": f"issue::{rec['num']}",
-                "type": "issue",
-                "text": text[:CHUNK_MAX],
-                "meta": {"num": rec["num"], "title": rec["title"]},
-            })
+        # Issue/PR 可能不存在，跳过
+        try:
+            r = s.run("""
+                MATCH (i:Issue)
+                RETURN i.number AS num, i.title AS title, i.body AS body
+                LIMIT 1000
+            """)
+            for rec in r:
+                body = (rec.get("body") or "")[:300]
+                text = f"Issue #{rec['num']}: {rec['title']}\n{body}"
+                chunks.append({
+                    "id": f"issue::{rec['num']}",
+                    "type": "issue",
+                    "text": text[:CHUNK_MAX],
+                    "meta": {"num": rec["num"], "title": rec["title"]},
+                })
+        except Exception:
+            pass
 
-        r = s.run("""
-            MATCH (p:PullRequest)
-            RETURN p.number AS num, p.title AS title, p.body AS body
-        """)
-        for rec in r:
-            body = (rec.get("body") or "")[:200]
-            text = f"PR #{rec['num']}: {rec['title']}\n{body}"
-            chunks.append({
-                "id": f"pr::{rec['num']}",
-                "type": "pr",
-                "text": text[:CHUNK_MAX],
-                "meta": {"num": rec["num"], "title": rec["title"]},
-            })
+        try:
+            r = s.run("""
+                MATCH (p:PullRequest)
+                RETURN p.number AS num, p.title AS title, p.body AS body
+                LIMIT 1000
+            """)
+            for rec in r:
+                body = (rec.get("body") or "")[:200]
+                text = f"PR #{rec['num']}: {rec['title']}\n{body}"
+                chunks.append({
+                    "id": f"pr::{rec['num']}",
+                    "type": "pr",
+                    "text": text[:CHUNK_MAX],
+                    "meta": {"num": rec["num"], "title": rec["title"]},
+                })
+        except Exception:
+            pass
 
     return chunks
 
@@ -260,7 +264,7 @@ def cmd_run(args):
                 "类别": category,
                 "子类": subcat,
                 "具体问题": question,
-                "参考答案": row.get("答案", row.get("full_answer", "")),
+                "参考答案": str(row.get("答案", row.get("full_answer", ""))) if pd.notna(row.get("答案", "")) else "",
                 "生成答案": answer,
                 "Evidence": evidence_raw,
                 "证据命中": ev_hit,
@@ -275,7 +279,7 @@ def cmd_run(args):
                 "类别": category,
                 "子类": subcat,
                 "具体问题": question,
-                "参考答案": row.get("答案", row.get("full_answer", "")),
+                "参考答案": str(row.get("答案", row.get("full_answer", ""))) if pd.notna(row.get("答案", "")) else "",
                 "生成答案": "",
                 "Evidence": evidence_raw,
                 "证据命中": {},

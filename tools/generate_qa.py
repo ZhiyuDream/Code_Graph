@@ -1,9 +1,3 @@
-import sys
-from pathlib import Path
-_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_ROOT / "src"))   # 核心库
-sys.path.insert(0, str(_ROOT))             # 根目录（config.py）
-
 #!/usr/bin/env python3
 """
 基于代码图真实数据自动生成高质量 QA 题目。
@@ -11,8 +5,19 @@ sys.path.insert(0, str(_ROOT))             # 根目录（config.py）
 
 用法：
   python generate_qa.py [--count 100] [--output PATH]
+
+相关脚本说明：
+  - generate_qa_v3.py: 三类问题混合生成 (Issue驱动40% + 代码理解30% + 工作流30%)
+  - generate_qa_from_github.py (已合并): 从 GitHub PR/Issue 生成问题
+  - generate_qa_from_source.py (已合并): 直接从源码生成问题（不依赖图谱）
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_ROOT / "src"))   # 核心库
+sys.path.insert(0, str(_ROOT))             # 根目录（config.py）
 
 import argparse
 import csv

@@ -11,10 +11,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from clangd_client import start_clangd, initialize, request, notify
+from src.clangd_client import start_clangd, initialize, request, notify
 
 # 与 ast_parser 一致
-SOURCE_EXTENSIONS = {".c", ".cpp", ".cc", ".cxx"}
+SOURCE_EXTENSIONS = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
 # LSP SymbolKind（数字）：Method=6, Constructor=9, Function=12, Class=5, Struct=23, Variable=13, Field=7, etc.
 KIND_FUNCTION = {6, 9, 10, 12}
@@ -59,6 +59,29 @@ def _get_source_files_from_compile_commands(compile_commands_dir: Path) -> list[
             seen.add(fpath)
             out.append(fpath)
     return sorted(out)
+
+
+def _get_header_files(repo_root: Path) -> list[str]:
+    """遍历仓库，找出所有头文件（.h, .hpp）的绝对路径。"""
+    if not repo_root or not repo_root.exists():
+        return []
+    
+    header_exts = {".h", ".hpp"}
+    headers: list[str] = []
+    
+    # 跳过的目录
+    skip_dirs = {'.git', 'build', 'bin', 'obj', '.cache', 'node_modules', 'venv', '.venv', '__pycache__'}
+    
+    for root, dirs, files in os.walk(repo_root):
+        # 跳过不需要的目录
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+        
+        for f in files:
+            if Path(f).suffix.lower() in header_exts:
+                full_path = os.path.join(root, f)
+                headers.append(os.path.normpath(full_path))
+    
+    return sorted(headers)
 
 
 def _range_to_lines(r: dict) -> tuple[int, int]:
@@ -240,7 +263,16 @@ def collect_all_via_clangd(
     """
     repo = repo_root or compile_commands_dir.parent
     source_files = _get_source_files_from_compile_commands(compile_commands_dir)
-    if not source_files:
+    
+    # 获取头文件并合并
+    header_files = _get_header_files(Path(repo))
+    all_files = sorted(set(source_files + header_files))
+    
+    print(f"compile_commands.json 源文件: {len(source_files)} 个")
+    print(f"发现头文件: {len(header_files)} 个")
+    print(f"总计待解析: {len(all_files)} 个文件")
+    
+    if not all_files:
         return [], []
 
     proc = start_clangd(Path(repo).resolve(), Path(compile_commands_dir).resolve())
@@ -254,7 +286,7 @@ def collect_all_via_clangd(
         all_functions: list[dict[str, Any]] = []
         var_refs_global: list[tuple[str, str, int]] = []
 
-        for i, abs_path in enumerate(source_files):
+        for i, abs_path in enumerate(all_files):
             if repo_root and abs_path.startswith(str(repo_root)):
                 file_path = os.path.relpath(abs_path, repo_root)
             else:
