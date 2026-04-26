@@ -106,12 +106,16 @@ def binary_judge(client, question: str, reference: str, generated: str) -> dict[
     )
     
     try:
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            timeout=60,
-        )
+        kwargs = {
+            'model': LLM_MODEL,
+            'messages': [{"role": "user", "content": prompt}],
+            'timeout': 60,
+        }
+        if LLM_MODEL.startswith('gpt-5') or LLM_MODEL.startswith('o1') or LLM_MODEL.startswith('o3'):
+            kwargs['max_completion_tokens'] = 300
+        else:
+            kwargs['max_tokens'] = 300
+        resp = client.chat.completions.create(**kwargs)
         text = (resp.choices[0].message.content or "").strip()
         
         # 解析结果
@@ -160,12 +164,16 @@ def graded_judge(client, question: str, reference: str, generated: str) -> dict[
     )
     
     try:
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            timeout=60,
-        )
+        kwargs = {
+            'model': LLM_MODEL,
+            'messages': [{"role": "user", "content": prompt}],
+            'timeout': 60,
+        }
+        if LLM_MODEL.startswith('gpt-5') or LLM_MODEL.startswith('o1') or LLM_MODEL.startswith('o3'):
+            kwargs['max_completion_tokens'] = 300
+        else:
+            kwargs['max_tokens'] = 300
+        resp = client.chat.completions.create(**kwargs)
         text = (resp.choices[0].message.content or "").strip()
         
         # 解析分数

@@ -1,0 +1,34 @@
+问题: {question}
+
+【已收集函数】(共{function_count}个，按相似度排序):
+{function_list}
+
+【相关Issue】(共{issue_count}个):
+{issue_list}
+
+【已扩展调用链】(共{chain_count}条):
+{chain_list}
+
+---
+
+你是代码检索专家。请根据当前已收集的信息和问题类型，选择最合适的下一步行动。
+
+【可用工具】
+{actions}
+
+【决策原则】
+- 调用链/依赖问题 → 用 expand_callers / expand_callees
+- 同文件协作问题 → 用 expand_same_file
+- 信息已足够 → 用 sufficient
+
+【重要】不要重复扩展已标记[已扩展]的函数。
+
+返回JSON:
+{{
+    "thought": "分析现有信息和下一步计划（30字以内）",
+    "sufficient": false,
+    "action": "{action_choices}",
+    "target": "目标函数名"
+}}
+
+只输出JSON:
