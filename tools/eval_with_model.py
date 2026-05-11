@@ -37,9 +37,9 @@ def judge_single(args):
     """评估单个题目"""
     client, item, model_name = args
     
-    question = str(item.get("具体问题", "") or "")
-    reference = str(item.get("参考答案", "") or "")
-    generated = str(item.get("生成答案", "") or "")
+    question = str(item.get("具体问题", "") or item.get("question", "") or "")
+    reference = str(item.get("参考答案", "") or item.get("answer", "") or item.get("reference", "") or "")
+    generated = str(item.get("生成答案", "") or item.get("generated", "") or "")
     
     if not generated:
         return item, False, "无生成答案"
@@ -54,7 +54,7 @@ def judge_single(args):
         kwargs = {
             'model': model_name,
             'messages': [{"role": "user", "content": prompt}],
-            'timeout': 60,
+            'timeout': 600,
         }
         # gpt-5.x / o1 / o3 使用 max_completion_tokens
         if model_name.startswith('gpt-5') or model_name.startswith('o1') or model_name.startswith('o3'):

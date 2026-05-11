@@ -96,7 +96,7 @@ REQUIREMENT:
                 {"role": "user", "content": prompt},
             ],
             stream=False,
-            timeout=60,
+            timeout=600,
         )
         score_str = resp.choices[0].message.content.strip()
         if score_str.startswith("```json"):

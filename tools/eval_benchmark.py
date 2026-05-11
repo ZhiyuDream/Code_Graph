@@ -109,7 +109,7 @@ def binary_judge(client, question: str, reference: str, generated: str) -> dict[
         kwargs = {
             'model': LLM_MODEL,
             'messages': [{"role": "user", "content": prompt}],
-            'timeout': 60,
+            'timeout': 600,
         }
         if LLM_MODEL.startswith('gpt-5') or LLM_MODEL.startswith('o1') or LLM_MODEL.startswith('o3'):
             kwargs['max_completion_tokens'] = 300
@@ -167,7 +167,7 @@ def graded_judge(client, question: str, reference: str, generated: str) -> dict[
         kwargs = {
             'model': LLM_MODEL,
             'messages': [{"role": "user", "content": prompt}],
-            'timeout': 60,
+            'timeout': 600,
         }
         if LLM_MODEL.startswith('gpt-5') or LLM_MODEL.startswith('o1') or LLM_MODEL.startswith('o3'):
             kwargs['max_completion_tokens'] = 300

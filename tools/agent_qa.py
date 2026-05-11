@@ -1042,7 +1042,7 @@ def _generate_from_rag(client, question: str, chunks: list) -> str:
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=700,
-        timeout=60,
+        timeout=600,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -1132,7 +1132,7 @@ def run_agent_minimal(driver, question: str) -> tuple[str, list, int, dict]:
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=700,
-            timeout=60,
+            timeout=600,
         )
         answer = (resp.choices[0].message.content or "").strip()
         token_usage = resp.usage.model_dump() if resp.usage else {}
@@ -1187,7 +1187,7 @@ def run_agent(driver, question: str, minimal_mode: bool = False, with_annotation
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            timeout=60,
+            timeout=600,
         )
         usage = resp.usage
         if usage:
@@ -1264,7 +1264,7 @@ def run_agent(driver, question: str, minimal_mode: bool = False, with_annotation
                                "content": "请根据以上工具查询结果，现在给出最终答案。"}],
         tools=TOOLS,
         tool_choice="auto",
-        timeout=60,
+        timeout=600,
     )
     usage = resp.usage
     if usage:

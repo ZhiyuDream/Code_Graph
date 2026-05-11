@@ -98,7 +98,7 @@ def clone_repo(project: str, repos: dict[str, tuple[str, str]]) -> bool:
     if commit:
         result = subprocess.run(
             ["git", "checkout", "--quiet", commit],
-            cwd=clone_dir, capture_output=True, text=True, timeout=60,
+            cwd=clone_dir, capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
             print(f"  {project}: checkout failed: {result.stderr[:200]}")
@@ -333,7 +333,7 @@ Output ONLY valid JSON: {{"correctness":1-10,"completeness":1-10,"relevance":1-1
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            timeout=60,
+            timeout=600,
         )
         content = resp.choices[0].message.content.strip()
         if content.startswith("```json"):

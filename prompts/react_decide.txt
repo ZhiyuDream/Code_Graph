@@ -17,9 +17,16 @@
 {actions}
 
 【决策原则】
-- 调用链/依赖问题 → 用 expand_callers / expand_callees
-- 同文件协作问题 → 用 expand_same_file
-- 信息已足够 → 用 sufficient
+1. 以下情况必须继续扩展（不要选sufficient）：
+   - 当前收集的函数数 <= 3 个
+   - 问题是关于"调用链/依赖关系"但尚未扩展任何caller/callee
+   - 问题是关于"模块/架构设计"但只收集到零散函数，未形成完整图景
+   - 高相关函数（相似度>0.7）的代码明显不足以回答问题
+   - 代码位置类问题但未定位到具体行号或函数
+
+2. 调用链/依赖问题 → 优先用 expand_callers / expand_callees
+3. 同文件协作问题 → 用 expand_same_file
+4. 信息已充足 → 用 sufficient（需要至少5个相关函数或高相似度函数>=3个）
 
 【重要】不要重复扩展已标记[已扩展]的函数。
 

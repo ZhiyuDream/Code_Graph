@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,43 @@ from config import OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL
 
 # 全局客户端实例缓存
 _clients = {}
+
+# 线程局部 token usage 记录
+_usage_local = threading.local()
+
+def _init_usage():
+    if not hasattr(_usage_local, 'usages'):
+        _usage_local.usages = []
+
+def record_usage(usage):
+    """记录一次调用的 token usage"""
+    _init_usage()
+    if usage:
+        _usage_local.usages.append({
+            'prompt_tokens': getattr(usage, 'prompt_tokens', 0),
+            'completion_tokens': getattr(usage, 'completion_tokens', 0),
+            'total_tokens': getattr(usage, 'total_tokens', 0),
+            'reasoning_tokens': getattr(getattr(usage, 'completion_tokens_details', None), 'reasoning_tokens', 0) or 0,
+        })
+
+def get_usage_stats() -> dict:
+    """获取当前线程累计的 token usage 统计"""
+    _init_usage()
+    usages = _usage_local.usages
+    if not usages:
+        return {}
+    return {
+        'call_count': len(usages),
+        'prompt_tokens': sum(u['prompt_tokens'] for u in usages),
+        'completion_tokens': sum(u['completion_tokens'] for u in usages),
+        'total_tokens': sum(u['total_tokens'] for u in usages),
+        'reasoning_tokens': sum(u['reasoning_tokens'] for u in usages),
+    }
+
+def reset_usage_stats():
+    """重置当前线程的 token usage 记录"""
+    _init_usage()
+    _usage_local.usages = []
 
 
 def get_llm_client(provider: str = "openai") -> OpenAI:
@@ -58,7 +96,7 @@ def _get_model_config(model: str):
 def call_llm(
     messages: list[dict],
     max_tokens: int = 1000,
-    timeout: int = 60,
+    timeout: int = 600,
     max_retries: int = 3,
     model: str = None,
     provider: str = None,
@@ -99,6 +137,10 @@ def call_llm(
             resp = client.chat.completions.create(**kwargs)
             content = resp.choices[0].message.content or ""
             
+            # 记录 token usage
+            if hasattr(resp, 'usage') and resp.usage:
+                record_usage(resp.usage)
+            
             # DeepSeek 可能有 reasoning_content
             # 注意：如果使用了 response_format={'type': 'json_object'}，
             # 不应 fallback 到 reasoning_content（reasoning 不是 JSON）
@@ -128,7 +170,7 @@ def call_llm(
 def call_llm_json(
     messages: list[dict],
     max_tokens: int = 500,
-    timeout: int = 60,
+    timeout: int = 600,
     model: str = None,
     provider: str = None
 ) -> dict | None:

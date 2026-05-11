@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """
-V8 + DeepSeek-v4-pro + ReAct代码Agent（修复版）
+V8 ReAct Agent - 组件化消融实验版
 
-核心改进：
-1. Prompt 文件化管理（prompts/ 目录）
-2. File Expansion 后移为 ReAct action（P2）
-3. ReAct action 扩展：caller/callee/same_file/same_class（P3）
-4. 完整检索轨迹记录
-
-数据集: results/qav2_test_cleaned.csv
-模型: deepseek-v4-pro (max_tokens=8192)
-评估: gpt-4.1-mini
+支持可选检索器组合：embedding, grep, graph, issue
+支持自定义 benchmark (JSON) 和模型
 """
 from __future__ import annotations
 
 import os
 import sys
 import json
-import csv
 import time
+import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-os.environ['LLM_MODEL'] = 'deepseek-v4-pro'
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -38,6 +29,8 @@ from tools.search import (
 )
 from tools.search.grep_search_v2 import grep_codebase
 from tools.search.semantic_search import _load_rag_index
+from qa_framework.retrievers.graph_retriever import GraphRetriever
+from config import NEO4J_DATABASE, REPO_ROOT, LLM_MODEL, OPENAI_BASE_URL
 
 MAX_STEPS = 5
 FALLBACK_THRESHOLD = 0.5
@@ -51,58 +44,88 @@ def get_rag_index():
     return _rag_index_cache
 
 
-def initial_search(driver, question: str) -> tuple[dict, dict]:
+def initial_search(driver, question: str, retrievers: set, repo_root: str) -> tuple[dict, dict]:
     """
-    初始检索（不做 file expansion，保持上下文干净）
-    返回: (collected_dict, trace_dict)
+    初始检索（组件化）
+    retrievers: {'embedding', 'grep', 'graph', 'issue'}
     """
-    trace = {"phase": "initial_search", "question": question}
-    
-    # 1. Embedding 检索
-    funcs = search_functions_by_text(question, top_k=10)
-    trace["embedding_search"] = [
-        {"name": f.get('name'), "file": f.get('file'), "score": f.get('score')} 
-        for f in funcs
-    ]
-    
-    # 2. Fallback（低相似度时激活）
-    max_score = max([f.get('score', 0) for f in funcs], default=0)
+    trace = {"phase": "initial_search", "question": question, "retrievers": list(retrievers)}
+    funcs = []
     fallback_triggered = False
     fallback_results = []
     
-    if max_score < FALLBACK_THRESHOLD:
-        fallback_triggered = True
-        entities = extract_entities_from_question(question)
-        trace["extracted_entities"] = entities
-        
-        for entity in entities[:2]:
-            entity_results = {"entity": entity}
+    # 1. Embedding 检索
+    if "embedding" in retrievers:
+        emb_funcs = search_functions_by_text(question, top_k=20)
+        trace["embedding_search"] = [
+            {"name": f.get('name'), "file": f.get('file'), "score": f.get('score')} 
+            for f in emb_funcs
+        ]
+        for fn in emb_funcs:
+            if not any(f['name'] == fn['name'] for f in funcs):
+                funcs.append(fn)
+    
+    # 2. Graph 检索（关键词匹配函数名 + CALLS扩展）
+    if "graph" in retrievers:
+        graph_retriever = GraphRetriever(
+            driver=driver,
+            repo_root=repo_root,
+            database=NEO4J_DATABASE,
+            enabled=True,
+            expand_calls_depth=1,
+        )
+        graph_results = graph_retriever.retrieve(question, top_k=10)
+        trace["graph_search"] = len(graph_results)
+        for r in graph_results:
+            if r.type == "function":
+                fn = {
+                    'name': r.id.split(":")[-1] if ":" in r.id else r.id,
+                    'file': r.metadata.get('file_path', ''),
+                    'text': r.content,
+                    'score': r.score,
+                    'source': 'graph',
+                }
+                if not any(f['name'] == fn['name'] for f in funcs):
+                    funcs.append(fn)
+    
+    # 3. Grep 检索
+    if "grep" in retrievers:
+        max_score = max([f.get('score', 0) for f in funcs], default=0)
+        if max_score < FALLBACK_THRESHOLD or "embedding" not in retrievers:
+            fallback_triggered = True
+            entities = extract_entities_from_question(question)
+            trace["extracted_entities"] = entities
             
-            if '-' in entity or entity.islower():
-                module_funcs = search_module_functions(entity, limit=5)
-                if module_funcs:
-                    entity_results["module_search"] = len(module_funcs)
-                    for fn in module_funcs:
+            for entity in entities[:2]:
+                entity_results = {"entity": entity}
+                
+                if '-' in entity or entity.islower():
+                    module_funcs = search_module_functions(entity, limit=5)
+                    if module_funcs:
+                        entity_results["module_search"] = len(module_funcs)
+                        for fn in module_funcs:
+                            if not any(f['name'] == fn['name'] for f in funcs):
+                                funcs.append(fn)
+                
+                grep_results = grep_codebase(entity, limit=3)
+                if grep_results:
+                    entity_results["grep_search"] = len(grep_results)
+                    new_funcs = convert_grep_to_function_results(grep_results)
+                    for fn in new_funcs:
                         if not any(f['name'] == fn['name'] for f in funcs):
                             funcs.append(fn)
-            
-            grep_results = grep_codebase(entity, limit=3)
-            if grep_results:
-                entity_results["grep_search"] = len(grep_results)
-                new_funcs = convert_grep_to_function_results(grep_results)
-                for fn in new_funcs:
-                    if not any(f['name'] == fn['name'] for f in funcs):
-                        funcs.append(fn)
-            
-            fallback_results.append(entity_results)
+                
+                fallback_results.append(entity_results)
     
     trace["fallback_triggered"] = fallback_triggered
     trace["fallback_results"] = fallback_results
     
-    # 3. Issue 检索
-    issues = search_issues(question, top_k=3)
+    # 4. Issue 检索
+    issues = []
+    if "issue" in retrievers:
+        issues = search_issues(question, top_k=3)
     trace["issues"] = [
-        {"number": i.get('number'), "title": i.get('title')[:80]} for i in issues
+        {"number": i.get('number'), "title": (i.get('title') or '')[:80]} for i in issues
     ]
     
     collected = {
@@ -116,15 +139,11 @@ def initial_search(driver, question: str) -> tuple[dict, dict]:
     return collected, trace
 
 
-def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]:
-    """
-    ReAct 决策（使用 prompt 文件）
-    返回: (decision_dict, decision_trace)
-    """
+def react_decide(question: str, collected: dict, step: int, model: str, provider: str) -> tuple[dict, dict]:
+    """ReAct 决策"""
     funcs = collected.get("functions", [])
     chains = collected.get("call_chains", [])
     
-    # 构建函数列表文本
     expanded = [c['from'] for c in chains]
     func_lines = []
     for i, f in enumerate(funcs[:8]):
@@ -133,11 +152,9 @@ def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]
         marker = " [已扩展]" if f['name'] in expanded else ""
         func_lines.append(f"{i+1}. {f['name']} ({source}, {score:.3f}){marker}")
     
-    # 如果有更多函数，简略展示
     if len(funcs) > 8:
         func_lines.append(f"   ... 还有 {len(funcs)-8} 个函数")
     
-    # Issue 列表
     issue_lines = []
     if collected.get("issues"):
         for i, issue in enumerate(collected["issues"][:2]):
@@ -145,7 +162,6 @@ def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]
     else:
         issue_lines.append("无")
     
-    # 调用链列表
     chain_lines = []
     if chains:
         for c in chains[-3:]:
@@ -153,12 +169,10 @@ def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]
     else:
         chain_lines.append("无")
     
-    # 加载 action 定义
     actions_text = format_actions_for_prompt()
     action_names = get_action_names()
     action_choices = "|".join(action_names)
     
-    # 从文件加载 prompt
     prompt = load_prompt(
         "react_decide",
         question=question,
@@ -172,23 +186,20 @@ def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]
         action_choices=action_choices,
     )
     
-    # 调用 DeepSeek 决策
     result = call_llm_json(
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=300,  # call_llm_json 会自动调整为1200
+        max_tokens=300,
         timeout=600,
-        model='deepseek-v4-pro',
-        provider='deepseek'
+        model=model,
+        provider=provider,
     )
     
-    # 决策 trace
     decision_trace = {
         "step": step,
         "prompt": prompt[:500],
         "raw_response": result,
     }
     
-    # 解析决策
     if result is None:
         decision_trace["fallback"] = "json_parse_failed"
         return {"sufficient": True, "action": "sufficient", "target": ""}, decision_trace
@@ -203,24 +214,21 @@ def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]
     action = result.get("action", "")
     target = result.get("target", "")
     
-    # 验证 target 是否在前 8 个函数中
     valid_targets = [f['name'] for f in funcs[:8]]
     if target not in valid_targets:
-        # 选择第一个未扩展的函数作为 fallback
         for f in funcs[:5]:
             if f['name'] not in expanded:
                 target = f['name']
-                decision_trace["target_fallback"] = f"original '{target}' not in valid list, fallback to '{f['name']}'"
+                decision_trace["target_fallback"] = f"fallback to '{f['name']}'"
                 break
         else:
             target = funcs[0]['name'] if funcs else ""
             decision_trace["target_fallback"] = "fallback to first function"
     
-    # 验证 action 是否有效
     valid_actions = get_action_names()
     if action not in valid_actions:
         action = "expand_callees"
-        decision_trace["action_fallback"] = f"invalid action, fallback to expand_callees"
+        decision_trace["action_fallback"] = "invalid action, fallback to expand_callees"
     
     return {
         "thought": result.get("thought", ""),
@@ -232,8 +240,6 @@ def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]
 
 def execute_action(action: str, target: str) -> dict:
     """执行 ReAct action"""
-    impl = get_action_impl(action)
-    
     if action == "expand_callers":
         return expand_call_chain(target, "callers")
     elif action == "expand_callees":
@@ -246,19 +252,16 @@ def execute_action(action: str, target: str) -> dict:
         return {"functions": [], "source": target, "type": "unknown"}
 
 
-def react_search(driver, question: str, trace: dict) -> tuple[dict, dict]:
-    """
-    ReAct 搜索循环
-    返回: (collected, trace)
-    """
-    collected, initial_trace = initial_search(driver, question)
+def react_search(driver, question: str, trace: dict, retrievers: set, repo_root: str, model: str, provider: str) -> tuple[dict, dict]:
+    """ReAct 搜索循环"""
+    collected, initial_trace = initial_search(driver, question, retrievers, repo_root)
     trace["initial"] = initial_trace
     
     info_gain_history = []
     react_steps = []
     
     for step in range(2, MAX_STEPS + 1):
-        decision, decision_trace = react_decide(question, collected, step)
+        decision, decision_trace = react_decide(question, collected, step, model, provider)
         
         action = decision.get("action")
         target = decision.get("target", "")
@@ -273,7 +276,6 @@ def react_search(driver, question: str, trace: dict) -> tuple[dict, dict]:
             react_steps.append(step_trace)
             break
         
-        # 执行 action
         if target:
             expansion = execute_action(action, target)
             new_count = 0
@@ -308,7 +310,6 @@ def react_search(driver, question: str, trace: dict) -> tuple[dict, dict]:
             info_gain_history.append(new_count)
             react_steps.append(step_trace)
             
-            # 信息增益过低提前停止
             if step >= 3 and len(info_gain_history) >= 2:
                 if all(g <= 1 for g in info_gain_history[-2:]):
                     trace["early_stop"] = "info gain too low"
@@ -328,81 +329,121 @@ def react_search(driver, question: str, trace: dict) -> tuple[dict, dict]:
     return collected, trace
 
 
-def process_single(driver, client, row: dict, idx: int) -> dict:
+def process_single(driver, row: dict, idx: int, retrievers: set, repo_root: str, model: str, provider: str) -> dict:
     if idx % 20 == 0:
-        print(f"[{idx}] {row.get('具体问题', 'N/A')[:50]}...")
+        print(f"[{idx}] {row.get('question', 'N/A')[:50]}...")
+    
+    # 重置 token usage 统计
+    from tools.core.llm_client import reset_usage_stats, get_usage_stats
+    reset_usage_stats()
     
     start_time = time.time()
-    question = row.get('具体问题', '')
+    question = row.get('question', '')
     
     try:
-        # ReAct 检索 + 轨迹记录
         trace = {"index": idx, "question": question}
-        collected, trace = react_search(driver, question, trace)
+        collected, trace = react_search(driver, question, trace, retrievers, repo_root, model, provider)
         
-        # 生成答案
         answer = generate_answer(
             question=question,
             collected=collected,
             max_tokens=8192,
-            model='deepseek-v4-pro',
-            provider='deepseek'
+            model=model,
+            provider=provider,
         )
         latency = time.time() - start_time
         
+        # 收集工具调用统计
+        tool_stats = {}
+        for step in collected.get("steps", []):
+            action = step.get("action", "")
+            if action not in tool_stats:
+                tool_stats[action] = {"count": 0, "total_found": 0, "total_new": 0}
+            tool_stats[action]["count"] += 1
+            tool_stats[action]["total_found"] += step.get("found", 0)
+            tool_stats[action]["total_new"] += step.get("new", 0)
+        
+        # 获取 token usage
+        usage_stats = get_usage_stats()
+        
         return {
             "index": idx,
-            "具体问题": question,
-            "参考答案": row.get('答案', ''),
-            "生成答案": answer,
-            "路由类型": "V8_DeepSeek_ReAct_Agent",
-            "检索结果": {
+            "id": row.get('id', f'qa_{idx}'),
+            "question": question,
+            "reference": row.get('answer', ''),
+            "generated": answer,
+            "router": "V8_ReAct_Agent",
+            "retrievers": list(retrievers),
+            "retrieval": {
                 "function_count": len(collected.get("functions", [])),
                 "issue_count": len(collected.get("issues", [])),
                 "step_count": len(collected.get("steps", [])),
             },
-            "检索轨迹": trace,
-            "延迟_s": latency
+            "trace": trace,
+            "latency_s": latency,
+            "usage": usage_stats,
+            "tool_stats": tool_stats,
         }
     except Exception as e:
         import traceback
+        usage_stats = get_usage_stats()
         return {
             "index": idx,
-            "具体问题": question,
-            "生成答案": f"处理失败: {str(e)}\n{traceback.format_exc()}",
-            "路由类型": "V8_DeepSeek_ReAct_Agent",
-            "错误": str(e),
-            "检索轨迹": trace if 'trace' in dir() else {},
-            "延迟_s": time.time() - start_time
+            "id": row.get('id', f'qa_{idx}'),
+            "question": question,
+            "generated": f"处理失败: {str(e)}\n{traceback.format_exc()}",
+            "router": "V8_ReAct_Agent",
+            "retrievers": list(retrievers),
+            "error": str(e),
+            "trace": trace if 'trace' in dir() else {},
+            "latency_s": time.time() - start_time,
+            "usage": usage_stats,
+            "tool_stats": {},
         }
 
 
 def main():
-    rows = []
-    with open('results/qav2_test_cleaned.csv', 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--benchmark", type=Path, required=True, help="Benchmark JSON 路径")
+    parser.add_argument("--retrievers", default="embedding,issue", help="检索器组合: embedding,grep,graph,issue")
+    parser.add_argument("-o", "--output", type=Path, required=True, help="输出结果 JSON")
+    parser.add_argument("--model", default=LLM_MODEL, help="生成模型")
+    parser.add_argument("--provider", default="openai", help="模型 provider")
+    parser.add_argument("-w", "--workers", type=int, default=20, help="并行 worker 数")
+    parser.add_argument("--limit", type=int, default=0, help="只跑前 N 条")
+    parser.add_argument("--offset", type=int, default=0, help="从第 N 条开始跑")
+    args = parser.parse_args()
     
-    print(f"DeepSeek ReAct Agent 实验: {len(rows)} 题")
-    print(f"模型: deepseek-v4-pro")
-    print(f"max_tokens: 8192")
+    # 加载 benchmark
+    with open(args.benchmark, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    rows = data.get('questions', [])
+    if args.offset > 0:
+        rows = rows[args.offset:]
+    if args.limit > 0:
+        rows = rows[:args.limit]
+    
+    retrievers = set(args.retrievers.split(","))
+    repo_root = REPO_ROOT or "/root/data/zzy/llama.cpp"
+    
+    print(f"V8 ReAct Agent 消融实验")
+    print(f"Benchmark: {args.benchmark} ({len(rows)} 题)")
+    print(f"检索器: {', '.join(retrievers)}")
+    print(f"模型: {args.model} ({args.provider})")
     print(f"ReAct actions: {', '.join(get_action_names())}")
-    print(f"File expansion: 后移为 ReAct action")
-    print(f"并行: 20 workers")
-    print(f"估算耗时: ~{len(rows) * 60 / 20 / 60:.0f} 分钟")
+    print(f"并行: {args.workers} workers")
+    print(f"估算耗时: ~{len(rows) * 60 / args.workers / 60:.0f} 分钟")
     print()
     
     driver = get_neo4j_driver()
-    from tools.core.llm_client import get_llm_client
-    client = get_llm_client(provider='deepseek')
     
     results = []
     completed = 0
     
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
-            executor.submit(process_single, driver, client, row, i): i
+            executor.submit(process_single, driver, row, i, retrievers, repo_root, args.model, args.provider): i
             for i, row in enumerate(rows)
         }
         
@@ -415,7 +456,8 @@ def main():
                 if completed % 20 == 0 or completed == len(rows):
                     print(f"  已完成 {completed}/{len(rows)} 题...")
                     sorted_results = sorted(results, key=lambda x: x.get('index', 0))
-                    with open('results/v8_deepseek_react_fixed.json', 'w', encoding='utf-8') as f:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    with open(args.output, 'w', encoding='utf-8') as f:
                         json.dump(sorted_results, f, ensure_ascii=False, indent=2)
                         
             except Exception as e:
@@ -423,11 +465,12 @@ def main():
                 completed += 1
     
     sorted_results = sorted(results, key=lambda x: x.get('index', 0))
-    with open('results/v8_deepseek_react_fixed.json', 'w', encoding='utf-8') as f:
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(sorted_results, f, ensure_ascii=False, indent=2)
     
     print(f"\n完成！共处理 {len(results)}/{len(rows)} 题")
-    print(f"结果保存至: results/v8_deepseek_react_fixed.json")
+    print(f"结果保存至: {args.output}")
     
     close_neo4j_driver()
 

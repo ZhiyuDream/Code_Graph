@@ -120,7 +120,7 @@ RAG分数：[0到1之间的小数]
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=400,
-            timeout=60,
+            timeout=600,
         )
         content = (resp.choices[0].message.content or "").strip()
 

@@ -176,7 +176,7 @@ def generate_answer(client, question: str, chunks: list[dict]) -> tuple[str, dic
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=700,
-        timeout=60,
+        timeout=600,
     )
     usage = resp.usage.model_dump() if resp.usage else {}
     return (resp.choices[0].message.content or "").strip(), usage

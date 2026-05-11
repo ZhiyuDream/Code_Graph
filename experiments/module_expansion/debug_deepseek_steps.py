@@ -180,7 +180,7 @@ def react_decide(question: str, collected: dict, step: int, log: dict) -> dict:
     result = call_llm_json(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=300,
-        timeout=60,
+        timeout=600,
         model='deepseek-v4-pro',
         provider='deepseek'
     )

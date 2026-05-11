@@ -236,7 +236,7 @@ def react_decide(question: str, collected: dict, step: int) -> tuple[dict, dict]
     result = call_llm_json(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=300,  # call_llm_json 会自动调整为1200
-        timeout=60,
+        timeout=600,
         model='deepseek-v4-pro',
         provider='deepseek'
     )

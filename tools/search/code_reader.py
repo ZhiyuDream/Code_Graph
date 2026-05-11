@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Optional, Dict
 
 # 代码库根目录
-REPO_ROOT = Path("/data/yulin/RUC/llama.cpp")
+import os
+REPO_ROOT = Path(os.environ.get("REPO_ROOT", "/root/data/zzy/llama.cpp"))
 
 
 def read_function_from_file(
