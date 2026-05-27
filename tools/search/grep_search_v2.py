@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Literal
 
-REPO_ROOT = Path("/data/yulin/RUC/llama.cpp")
+REPO_ROOT = Path(os.environ.get("REPO_ROOT", "/root/data/zzy/llama.cpp"))
 
 
 def _run_rg(

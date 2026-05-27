@@ -6,113 +6,72 @@ from .llm_client import call_llm
 from .prompt_loader import load_prompt
 
 
-def _get_func_signature(fn: dict) -> str:
-    """提取函数签名或详情。"""
-    sig = fn.get('signature', '') or fn.get('detail', '')
-    return sig.strip() if sig else ''
-
-
-def _format_func_code(fn: dict, max_len: int = 2000) -> str:
-    """格式化函数代码片段，保留签名+正文。"""
-    text = fn.get('text', '')
-    if not text:
-        return ''
-    sig = _get_func_signature(fn)
-    # 如果签名在代码开头，避免重复
-    if sig and text.strip().startswith(sig.split('(')[0].strip()):
-        display = text[:max_len]
-    else:
-        prefix = f"{sig}\n" if sig else ""
-        display = prefix + text[:max_len - len(prefix)]
-    if len(text) > max_len:
-        display += "...(截断)"
-    return display
-
-
 def build_context(collected: Dict) -> str:
-    """构建上下文信息。
-    
-    改进点:
-    1. 所有函数统一提供代码片段（不再让 chain_funcs 裸奔）
-    2. 按综合相关性排序，而非按来源分类
-    3. 控制总长度避免信息淹没
-    4. 增加函数签名展示
-    """
+    """构建上下文信息"""
     funcs = collected.get("functions", [])
     issues = collected.get("issues", [])
     steps = collected.get("steps", [])
     
     lines = []
     
-    # ---- 统一整理所有函数，计算综合优先级 ----
-    scored_funcs = []
-    for fn in funcs:
-        source = fn.get('source', '') or 'embedding'
-        score = fn.get('score', 0)
-        # 综合优先级: embedding高分 > grep命中 > chain扩展 > file扩展 > 低分embedding
-        priority = 0
-        if source in ('', 'embedding'):
-            priority = score * 100  # 0-100
-        elif source == 'grep_fallback':
-            priority = 45
-        elif 'caller' in source or 'callee' in source:
-            priority = 40
-        elif source == 'file_expansion':
-            priority = 30
-        else:
-            priority = 20
-        scored_funcs.append((priority, fn))
+    # 按来源分类
+    embedding_funcs = [f for f in funcs if f.get('source') in ('', 'embedding')]
+    chain_funcs = [f for f in funcs if 'caller' in f.get('source', '') or 'callee' in f.get('source', '')]
+    grep_funcs = [f for f in funcs if f.get('source') == 'grep_fallback']
+    file_exp_funcs = [f for f in funcs if f.get('source') == 'file_expansion']
     
-    # 按优先级降序，去重（同名函数保留优先级高的）
-    scored_funcs.sort(key=lambda x: -x[0])
-    seen_names = set()
-    unique_funcs = []
-    for prio, fn in scored_funcs:
-        name = fn.get('name', '')
-        if name and name in seen_names:
-            continue
-        seen_names.add(name)
-        unique_funcs.append((prio, fn))
+    # 高相关函数（embedding，相似度>0.5）
+    high_rel = [f for f in embedding_funcs if f.get('score', 0) > 0.5]
+    if high_rel:
+        lines.append("【高相关函数】(Embedding检索，相似度>0.5)")
+        for i, fn in enumerate(high_rel[:5], 1):
+            lines.append(f"{i}. {fn['name']} @ {fn['file']}")
+            if fn.get('text'):
+                lines.append(f"   代码: {fn['text'][:150]}")
     
-    # ---- 函数上下文（统一格式）----
-    if unique_funcs:
-        lines.append("【相关函数代码】(按相关度排序，含签名与实现)")
-        for i, (prio, fn) in enumerate(unique_funcs[:8], 1):  # 最多8个
-            source = fn.get('source', '') or 'embedding'
-            score_tag = f"[相似度:{fn.get('score', 0):.2f}]" if fn.get('score') else ""
-            src_tag = f"[来源:{source}]" if source not in ('', 'embedding') else ""
-            lines.append(f"\n--- 函数 {i}: {fn['name']} @ {fn['file']} {score_tag} {src_tag} ---")
-            
-            sig = _get_func_signature(fn)
-            if sig:
-                lines.append(f"签名: {sig}")
-            
-            code = _format_func_code(fn, max_len=2000)
-            if code:
-                lines.append(f"代码:\n{code}")
+    # Grep fallback 函数
+    if grep_funcs:
+        lines.append(f"\n【Grep搜索补充函数】")
+        for i, fn in enumerate(grep_funcs[:3], 1):
+            lines.append(f"{i}. {fn['name']} @ {fn['file']}")
+            if fn.get('text'):
+                lines.append(f"   代码: {fn['text'][:150]}")
     
-    # ---- Issue信息 ----
+    # 文件级扩展的函数
+    if file_exp_funcs:
+        lines.append(f"\n【同文件相关函数】(文件级扩展发现)")
+        for i, fn in enumerate(file_exp_funcs[:10], 1):  # 增加到前10个
+            lines.append(f"{i}. {fn['name']} @ {fn['file']}")
+            if fn.get('text'):
+                # 增加代码片段长度，避免丢失关键信息
+                code = fn['text'][:500]  # 从100增加到500字符
+                if len(fn['text']) > 500:
+                    code += "...(截断)"
+                lines.append(f"   代码: {code}")
+    
+    # 调用链扩展的函数
+    if chain_funcs:
+        lines.append(f"\n【调用链相关函数】(通过ReAct扩展发现)")
+        for i, fn in enumerate(chain_funcs[:5], 1):
+            lines.append(f"{i}. {fn['name']} [{fn.get('source')}]")
+    
+    # Issue信息
     if issues:
-        lines.append(f"\n\n【相关Issue/PR】")
+        lines.append(f"\n【相关Issue/PR】")
         for i, issue in enumerate(issues[:3], 1):
             lines.append(f"{i}. #{issue['number']}: {issue['title']}")
             if issue.get('body'):
-                body = issue['body'][:4000]
-                if len(issue['body']) > 4000:
-                    body += "...(截断)"
-                lines.append(f"   {body}")
+                lines.append(f"   {issue['body'][:250]}")
     
-    # ---- ReAct探索过程（精简）----
+    # ReAct探索过程
     if steps:
-        lines.append(f"\n【检索过程摘要】")
+        lines.append(f"\n【检索过程】({len(steps)}轮)")
         for step in steps[:3]:
             action = step.get('action', '')
             if action == 'initial_search':
-                lines.append(f"  - 初始检索发现 {step.get('found', 0)} 个函数")
+                lines.append(f"  - 初始检索: 发现{step.get('found', 0)}个函数")
             elif action in ['expand_callers', 'expand_callees']:
                 lines.append(f"  - 扩展{action.split('_')[1]}: {step.get('target', '')}")
-            elif action == 'sufficient':
-                lines.append("  - 判定信息充足，停止检索")
     
     return '\n'.join(lines)
 

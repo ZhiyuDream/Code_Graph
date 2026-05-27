@@ -10,10 +10,17 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 from .models import ClassSymbol, FileResult, FunctionSymbol, ResolvedCalls, VariableSymbol
+
+try:
+    import community as community_louvain
+    _LOUVAIN_AVAILABLE = True
+except ImportError:
+    _LOUVAIN_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,74 @@ def _file_name(path: str) -> str:
     return Path(path).name
 
 
+def _deduplicate_functions(
+    file_results: list[FileResult],
+) -> tuple[list[FileResult], dict[str, str]]:
+    """
+    同名同文件函数去重。
+
+    策略：按 (file_path, name) 分组，每组保留 body 最长的（行数最多）
+    作为定义节点。如果是声明-only 的组，保留第一个。
+
+    Returns:
+        (去重后的 file_results, old_func_id -> new_func_id 映射)
+    """
+    from collections import defaultdict
+
+    # 按 (file_path, name) 分组
+    groups: dict[tuple[str, str], list[FunctionSymbol]] = defaultdict(list)
+    for fr in file_results:
+        for f in fr.functions:
+            groups[(f.file_path, f.name)].append(f)
+
+    # 选择代表 + 构建映射
+    old_to_new: dict[str, str] = {}
+    representatives: dict[tuple[str, str], FunctionSymbol] = {}
+
+    for key, funcs in groups.items():
+        if len(funcs) == 1:
+            representatives[key] = funcs[0]
+            continue
+
+        # 优先保留 is_definition=True 的
+        defs = [f for f in funcs if f.is_definition]
+        candidates = defs if defs else funcs
+
+        # 在候选中选行数最多的（body 最长）
+        best = max(candidates, key=lambda f: (f.end_line - f.start_line, f.start_line))
+        representatives[key] = best
+
+    # 构建 old -> new 映射
+    for key, funcs in groups.items():
+        rep = representatives[key]
+        for f in funcs:
+            if f.id != rep.id:
+                old_to_new[f.id] = rep.id
+
+    # 更新 file_results：替换函数列表
+    new_file_results: list[FileResult] = []
+    for fr in file_results:
+        new_funcs = []
+        seen_ids = set()
+        for f in fr.functions:
+            key = (f.file_path, f.name)
+            rep = representatives[key]
+            if rep.id not in seen_ids:
+                new_funcs.append(rep)
+                seen_ids.add(rep.id)
+        new_file_results.append(FileResult(
+            file_path=fr.file_path,
+            functions=new_funcs,
+            classes=fr.classes,
+            variables=fr.variables,
+            calls=fr.calls,
+            var_refs=fr.var_refs,
+            raw=fr.raw,
+        ))
+
+    return new_file_results, old_to_new
+
+
 def assemble_graph(
     file_results: list[FileResult],
     resolved_calls: ResolvedCalls,
@@ -70,6 +145,12 @@ def assemble_graph(
     Returns:
         {"nodes": {...}, "edges": {...}}
     """
+    # ---- P0: 去重 ----
+    file_results, id_remap = _deduplicate_functions(file_results)
+
+    def remap_id(fid: str) -> str:
+        return id_remap.get(fid, fid)
+
     # ---- 第一阶段：收集所有全局实体 ----
     file_paths: set[str] = set()
     functions: list[dict[str, Any]] = []
@@ -125,6 +206,7 @@ def assemble_graph(
             if sf is not None and 0 <= sf < len(fr.functions):
                 parent_type = "Function"
                 parent_id = fr.functions[sf].id or _func_id(fp, fr.functions[sf].name, fr.functions[sf].start_line)
+                parent_id = remap_id(parent_id)
             elif sc is not None and 0 <= sc < len(fr.classes):
                 parent_type = "Class"
                 parent_id = _class_id(fp, fr.classes[sc].name, fr.classes[sc].start_line)
@@ -141,11 +223,16 @@ def assemble_graph(
         for func_idx, var_id, line in fr.var_refs:
             if 0 <= func_idx < len(fr.functions):
                 fid = fr.functions[func_idx].id or _func_id(fp, fr.functions[func_idx].name, fr.functions[func_idx].start_line)
-                refs_raw.append((fid, var_id, line))
+                fid = remap_id(fid)
+                if fid in func_by_id:
+                    refs_raw.append((fid, var_id, line))
 
-    # 跨文件 var_refs
+    # 跨文件 var_refs（应用去重映射，过滤无效引用）
     if var_refs_global:
-        refs_raw.extend(var_refs_global)
+        for func_id, var_id, line in var_refs_global:
+            new_fid = remap_id(func_id)
+            # 延迟检查：在 func_by_id 构建完成后再验证
+            refs_raw.append((new_fid, var_id, line))
 
     # ---- 第二阶段：变量引用统一聚合（消除时序盲区）----
     refs_agg: dict[tuple[str, str], list[int]] = {}
@@ -259,20 +346,61 @@ def assemble_graph(
             })
             edges["HAS_MEMBER"].append((v["parent_id"], v["id"], {}))
 
-    # REFERENCES_VAR 边
+    # REFERENCES_VAR 边（过滤无效引用：函数或变量已被删除）
+    valid_var_ids = set(variables_by_id.keys())
     for (func_id, var_id), lines in refs_agg.items():
-        edges["REFERENCES_VAR"].append((func_id, var_id, {"lines": sorted(set(lines))}))
+        if func_id in func_by_id and var_id in valid_var_ids:
+            edges["REFERENCES_VAR"].append((func_id, var_id, {"lines": sorted(set(lines))}))
 
-    # CALLS 边（使用 call_resolver 的输出）
+    # CALLS 边（使用 call_resolver 的输出，应用去重映射）
+    seen_calls = set()
     for caller_id, callee_id in resolved_calls.calls:
-        edges["CALLS"].append((caller_id, callee_id, {}))
+        new_caller = remap_id(caller_id)
+        new_callee = remap_id(callee_id)
+        if new_caller == new_callee:
+            continue
+        call_key = (new_caller, new_callee)
+        if call_key not in seen_calls:
+            edges["CALLS"].append((new_caller, new_callee, {}))
+            seen_calls.add(call_key)
 
-    # CALLS_AMBIGUOUS 边
+    # CALLS_AMBIGUOUS 边（去重后若只剩一个候选，升级为 CALLS）
     for caller_id, callee_name, candidate_ids in resolved_calls.ambiguous:
-        edges["CALLS_AMBIGUOUS"].append((caller_id, f"ambiguous:{callee_name}", {
-            "callee_name": callee_name,
-            "candidates": candidate_ids,
-        }))
+        new_caller = remap_id(caller_id)
+        # 去重映射 + 去重
+        seen = set()
+        remapped_candidates = []
+        for cid in candidate_ids:
+            new_cid = remap_id(cid)
+            if new_cid not in seen:
+                seen.add(new_cid)
+                remapped_candidates.append(new_cid)
+
+        if len(remapped_candidates) == 1:
+            # 去重后唯一，升级为 CALLS
+            callee_cid = remapped_candidates[0]
+            if new_caller != callee_cid:
+                call_key = (new_caller, callee_cid)
+                if call_key not in seen_calls:
+                    edges["CALLS"].append((new_caller, callee_cid, {}))
+                    seen_calls.add(call_key)
+        else:
+            edges["CALLS_AMBIGUOUS"].append((new_caller, f"ambiguous:{callee_name}", {
+                "callee_name": callee_name,
+                "candidates": remapped_candidates,
+            }))
+
+    # ---- P2: Louvain 社区发现 + Module 节点 ----
+    if _LOUVAIN_AVAILABLE:
+        _build_module_nodes(nodes, edges, functions, seen_calls)
+
+    logger.info(
+        "Graph assembled: %d functions, %d classes, %d variables, %d attributes, "
+        "%d calls, %d ambiguous, %d unresolved, %d modules",
+        len(functions), len(classes), len(variables_list), len(nodes["Attribute"]),
+        len(resolved_calls.calls), len(resolved_calls.ambiguous), len(resolved_calls.unresolved),
+        len(nodes.get("Module", []))
+    )
 
     logger.info(
         "Graph assembled: %d functions, %d classes, %d variables, %d attributes, "
@@ -282,3 +410,190 @@ def assemble_graph(
     )
 
     return {"nodes": nodes, "edges": edges}
+
+
+def _build_module_nodes(
+    nodes: dict[str, list[dict[str, Any]]],
+    edges: dict[str, list[tuple[str, str, dict[str, Any]]]],
+    functions: list[dict[str, Any]],
+    seen_calls: set[tuple[str, str]],
+) -> None:
+    """
+    使用 Louvain 算法对函数调用图进行社区发现，构建 Module 节点。
+
+    策略：
+    1. 基于 CALLS 边 + 文件共现构建加权图
+    2. 转为无向图，运行 Louvain 社区发现（低 resolution 产生大社区）
+    3. 过滤小社区，合并到最近的大社区
+    4. 为每个社区创建 Module 节点
+    5. 构建 BELONGS_TO 边和 MODULE_CALLS 边
+    """
+    import networkx as nx
+
+    func_ids = {f["id"] for f in functions}
+    if len(func_ids) < 10:
+        return
+
+    # 1. 构建加权无向图
+    G = nx.Graph()
+    for f in functions:
+        G.add_node(f["id"], name=f["name"], file_path=f.get("file_path", ""))
+
+    # CALLS 边权重 = 1.0
+    for caller_id, callee_id, _ in edges.get("CALLS", []):
+        if caller_id in func_ids and callee_id in func_ids and caller_id != callee_id:
+            if G.has_edge(caller_id, callee_id):
+                G[caller_id][callee_id]["weight"] += 1.0
+            else:
+                G.add_edge(caller_id, callee_id, weight=1.0)
+
+    # 文件共现边：同一文件中的函数权重 = 0.5
+    file_funcs: dict[str, list[str]] = {}
+    for f in functions:
+        file_funcs.setdefault(f.get("file_path", ""), []).append(f["id"])
+    for fp, fids in file_funcs.items():
+        if len(fids) < 2:
+            continue
+        for i in range(len(fids)):
+            for j in range(i + 1, len(fids)):
+                a, b = fids[i], fids[j]
+                if G.has_edge(a, b):
+                    G[a][b]["weight"] += 0.5
+                else:
+                    G.add_edge(a, b, weight=0.5)
+
+    if G.number_of_nodes() < 10 or G.number_of_edges() < 5:
+        logger.info("Module detection skipped: graph too small (%d nodes, %d edges)",
+                     G.number_of_nodes(), G.number_of_edges())
+        return
+
+    # 2. Louvain 社区发现（低 resolution 产生更大社区）
+    try:
+        partition = community_louvain.best_partition(G, weight="weight", resolution=0.3)
+    except Exception as e:
+        logger.warning("Louvain community detection failed: %s", e)
+        return
+
+    # 3. 合并小社区（< 10 个函数）到最近的大社区
+    communities: dict[int, list[str]] = {}
+    for func_id, comm_id in partition.items():
+        communities.setdefault(comm_id, []).append(func_id)
+
+    # 找出大社区（>= 10 个函数）
+    large_communities = {cid: members for cid, members in communities.items() if len(members) >= 10}
+    small_communities = {cid: members for cid, members in communities.items() if len(members) < 10}
+
+    if large_communities:
+        # 为每个小社区找到最相似的大社区（共享边最多）
+        for small_cid, small_members in small_communities.items():
+            best_large_cid = None
+            best_score = -1
+            for large_cid, large_members in large_communities.items():
+                # 计算小社区和大社区之间的连接数
+                score = sum(1 for m in small_members for lm in large_members if G.has_edge(m, lm))
+                if score > best_score:
+                    best_score = score
+                    best_large_cid = large_cid
+            # 如果没有任何连接，合并到最大的社区
+            if best_large_cid is None or best_score == 0:
+                best_large_cid = max(large_communities, key=lambda c: len(large_communities[c]))
+            # 合并
+            large_communities[best_large_cid].extend(small_members)
+
+        communities = large_communities
+    else:
+        # 如果没有大社区，保留所有社区
+        pass
+
+    # 4. 为每个社区创建 Module 节点
+    modules: list[dict[str, Any]] = []
+    func_to_module: dict[str, str] = {}
+
+    for idx, (comm_id, func_ids_in_comm) in enumerate(communities.items()):
+        module_id = f"module:{idx}"
+        module_name = _infer_module_name(func_ids_in_comm, G, functions)
+        # 确保模块名唯一
+        existing_names = {m["name"] for m in modules}
+        if module_name in existing_names:
+            module_name = f"{module_name}_{idx}"
+        file_paths = list(dict.fromkeys(
+            G.nodes[fid].get("file_path", "") for fid in func_ids_in_comm
+            if G.nodes[fid].get("file_path")
+        ))
+
+        modules.append({
+            "id": module_id,
+            "name": module_name,
+            "function_count": len(func_ids_in_comm),
+            "files": file_paths,
+        })
+
+        for fid in func_ids_in_comm:
+            func_to_module[fid] = module_id
+
+    nodes.setdefault("Module", []).extend(modules)
+
+    # 4. BELONGS_TO 边
+    edges.setdefault("BELONGS_TO", [])
+    for fid, module_id in func_to_module.items():
+        edges["BELONGS_TO"].append((fid, module_id, {}))
+
+    # 5. MODULE_CALLS 边（模块间调用）
+    module_calls: dict[tuple[str, str], int] = {}
+    for caller_id, callee_id, _ in edges.get("CALLS", []):
+        caller_mod = func_to_module.get(caller_id)
+        callee_mod = func_to_module.get(callee_id)
+        if caller_mod and callee_mod and caller_mod != callee_mod:
+            key = (caller_mod, callee_mod)
+            module_calls[key] = module_calls.get(key, 0) + 1
+
+    edges.setdefault("MODULE_CALLS", [])
+    for (m1, m2), weight in module_calls.items():
+        edges["MODULE_CALLS"].append((m1, m2, {"weight": weight}))
+
+    logger.info(
+        "Module detection: %d modules, %d functions assigned, %d inter-module calls",
+        len(modules), len(func_to_module), len(module_calls)
+    )
+
+
+def _infer_module_name(func_ids: list[str], G: Any, functions: list[dict[str, Any]]) -> str:
+    """
+    推断模块名称。
+
+    策略（按优先级）：
+    1. 基于文件路径的公共目录
+    2. 基于社区中度数最高的函数名
+    3. 兜底: module_{id}
+    """
+    # 收集文件路径
+    file_paths = [G.nodes[fid].get("file_path", "") for fid in func_ids if G.nodes[fid].get("file_path")]
+
+    # 策略1: 公共目录
+    if file_paths:
+        # 统一为目录列表
+        dirs = [os.path.dirname(fp).replace("\\", "/") for fp in file_paths]
+        # 找公共目录前缀
+        common_dir = os.path.commonprefix(dirs)
+        if common_dir:
+            common_dir = common_dir.rstrip("/")
+        # 如果公共前缀为空，找最频繁的目录
+        if not common_dir:
+            from collections import Counter
+            common_dir = Counter(dirs).most_common(1)[0][0]
+
+        if common_dir:
+            parts = common_dir.split("/")
+            if parts and parts[-1]:
+                return f"mod_{parts[-1]}"
+
+    # 策略2: 度数最高的函数名
+    degrees = {fid: G.degree(fid) for fid in func_ids if fid in G}
+    if degrees:
+        best_fid = max(degrees, key=degrees.get)
+        best_name = G.nodes[best_fid].get("name", "")
+        if best_name:
+            return f"mod_{best_name}"
+
+    # 兜底
+    return f"module_{func_ids[0].split(':')[-1] if func_ids else 'unknown'}"

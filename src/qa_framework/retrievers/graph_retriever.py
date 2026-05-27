@@ -22,6 +22,12 @@ from neo4j import GraphDatabase
 
 from .base import BaseRetriever, RetrievalResult
 
+# 高频函数降权（P2 优化）
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+from tools.search.frequency_penalty import is_high_frequency, DEFAULT_THRESHOLD
+
 logger = logging.getLogger(__name__)
 
 # 停用词
@@ -198,6 +204,61 @@ class GraphRetriever(BaseRetriever):
             r = s.run(cypher, func_ids=func_ids, limit=30)
             return [dict(rec) for rec in r]
 
+    def _expand_module(self, func_ids: list[str], keywords: list[str] = None, limit: int = 5) -> list[dict]:
+        """
+        P2: 模块扩展 — 召回命中函数所属 Module 的其他函数。
+
+        策略：
+        1. 找到 func_ids 所属的 Module
+        2. 对每个 Module，召回与问题关键词相关的 limit 个函数
+           （按度数排序，但只保留函数名或文件路径包含关键词的函数）
+        """
+        if not func_ids:
+            return []
+
+        # 构建关键词过滤条件（函数名或文件路径包含关键词）
+        if keywords:
+            kw_conditions = " OR ".join(
+                f"toLower(other.name) CONTAINS toLower('{kw.replace(chr(39), chr(39)+chr(39))}')"
+                f" OR toLower(other.file_path) CONTAINS toLower('{kw.replace(chr(39), chr(39)+chr(39))}')"
+                for kw in keywords
+            )
+            cypher = f"""
+                MATCH (f:Function)-[:BELONGS_TO]->(m:Module)
+                WHERE f.id IN $func_ids
+                WITH DISTINCT m
+                MATCH (other:Function)-[:BELONGS_TO]->(m)
+                WHERE NOT other.id IN $func_ids AND ({kw_conditions})
+                OPTIONAL MATCH (other)-[r:CALLS]->()
+                WITH other, count(r) AS degree
+                ORDER BY degree DESC
+                LIMIT $limit
+                RETURN other.id AS id, other.name AS name,
+                       other.file_path AS file_path,
+                       other.start_line AS start_line, other.end_line AS end_line,
+                       other.signature AS signature
+            """
+        else:
+            # 无关键词时回退到原有逻辑（按度数排序）
+            cypher = """
+                MATCH (f:Function)-[:BELONGS_TO]->(m:Module)
+                WHERE f.id IN $func_ids
+                WITH DISTINCT m
+                MATCH (other:Function)-[:BELONGS_TO]->(m)
+                WHERE NOT other.id IN $func_ids
+                OPTIONAL MATCH (other)-[r:CALLS]->()
+                WITH other, count(r) AS degree
+                ORDER BY degree DESC
+                LIMIT $limit
+                RETURN other.id AS id, other.name AS name,
+                       other.file_path AS file_path,
+                       other.start_line AS start_line, other.end_line AS end_line,
+                       other.signature AS signature
+            """
+        with self.driver.session(database=self.database) as s:
+            r = s.run(cypher, func_ids=func_ids, limit=limit)
+            return [dict(rec) for rec in r]
+
     def retrieve(self, question: str, top_k: int = 5) -> list[RetrievalResult]:
         if not self.enabled:
             return []
@@ -210,24 +271,53 @@ class GraphRetriever(BaseRetriever):
         # 2. Issue MENTIONS 关联函数
         funcs_by_issue = self._fetch_functions_by_issue_mentions(keywords, limit=top_k)
 
-        # 合并并去重
-        all_funcs: dict[str, dict] = {}
+        # 合并并去重（原始命中）
+        primary_funcs: dict[str, dict] = {}
         for f in funcs_by_kw + funcs_by_issue:
             fid = f.get("id")
-            if fid and fid not in all_funcs:
-                all_funcs[fid] = f
+            if fid and fid not in primary_funcs:
+                primary_funcs[fid] = f
 
-        # 3. CALLS 展开
-        if self.expand_calls_depth > 0 and all_funcs:
-            expanded = self._expand_calls(list(all_funcs.keys()), depth=self.expand_calls_depth)
+        # 3. CALLS 展开（过滤超高频函数，减少噪声）
+        call_funcs: dict[str, dict] = {}
+        if self.expand_calls_depth > 0 and primary_funcs:
+            expanded = self._expand_calls(list(primary_funcs.keys()), depth=self.expand_calls_depth)
             for f in expanded:
                 fid = f.get("id")
-                if fid and fid not in all_funcs:
-                    all_funcs[fid] = f
+                if fid and fid not in primary_funcs:
+                    # 过滤超高频基础函数（如 ggml_abort, max, min 等）
+                    if not is_high_frequency(f.get("name", "")):
+                        call_funcs[fid] = f
 
-        # 4. 读取完整代码
+        # 4. P2: Module 扩展 — 召回同模块的其他函数（过滤超高频）
+        module_funcs: dict[str, dict] = {}
+        all_so_far = {**primary_funcs, **call_funcs}
+        module_expanded = self._expand_module(list(all_so_far.keys()), keywords=keywords, limit=top_k)
+        for f in module_expanded:
+            fid = f.get("id")
+            if fid and fid not in all_so_far:
+                # 过滤超高频基础函数
+                if not is_high_frequency(f.get("name", "")):
+                    module_funcs[fid] = f
+
+        # 5. 按优先级合并并截断到 top_k * 2（给后续去重留空间）
+        combined: dict[str, dict] = {}
+        # 优先级1: 原始命中
+        for fid, f in list(primary_funcs.items())[:top_k]:
+            combined[fid] = f
+        # 优先级2: CALLS 扩展
+        for fid, f in list(call_funcs.items())[:top_k]:
+            if fid not in combined:
+                combined[fid] = f
+        # 优先级3: Module 扩展
+        module_limit = max(3, top_k // 2)
+        for fid, f in list(module_funcs.items())[:module_limit]:
+            if fid not in combined:
+                combined[fid] = f
+
+        # 6. 读取完整代码
         results = []
-        for fid, f in list(all_funcs.items())[:top_k]:
+        for fid, f in list(combined.items())[:top_k]:
             file_path = f.get("file_path", "")
             start_line = f.get("start_line", 0) or 0
             end_line = f.get("end_line", 0) or start_line

@@ -16,6 +16,7 @@ class FunctionSymbol:
     end_line: int = 0
     start_character: int = 0
     parent_class: str | None = None  # Python class methods
+    is_definition: bool = True  # False=前向声明/头文件声明, True=有实现的定义
 
 
 @dataclass

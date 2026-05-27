@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -140,6 +141,8 @@ def _walk_document_symbol_tree(
             if _is_function(kind) and name:
                 idx = len(functions)
                 func_id = f"{file_path}:{name}:{start_line}"
+                # 启发式判断：行数 >=3 认为是定义，否则是声明
+                is_def = (end_line - start_line) >= 2
                 functions.append(FunctionSymbol(
                     id=func_id,
                     name=name,
@@ -148,6 +151,7 @@ def _walk_document_symbol_tree(
                     start_line=start_line,
                     end_line=end_line,
                     start_character=start_char,
+                    is_definition=is_def,
                 ))
                 for child in s.get("children", []):
                     walk([child], idx, scope_class)
@@ -257,6 +261,7 @@ def extract_calls_for_function(
     file_path: str,
     repo_root: Path | None = None,
     sleep_after: float = 0.02,
+    skip_outgoing: bool = False,
 ) -> list[RawCall]:
     """
     对单个函数请求 callHierarchy/outgoingCalls。
@@ -268,10 +273,14 @@ def extract_calls_for_function(
         func: 函数符号
         file_path: 相对路径
         sleep_after: 每次请求后休眠时间
+        skip_outgoing: 如果为 True，直接返回空列表（用于 vendor 目录等场景）
 
     Returns:
         RawCall 列表
     """
+    if skip_outgoing:
+        return []
+
     line0 = max(0, func.start_line - 1)
     char0 = func.start_character
 
@@ -419,6 +428,73 @@ def _path_to_uri(path: str) -> str:
     return Path(path).resolve().as_uri()
 
 
+# C/C++ 关键字/保留字，不应被视为宏调用
+_CPP_KEYWORDS = {
+    "if", "else", "for", "while", "do", "switch", "case", "default",
+    "return", "break", "continue", "goto", "sizeof", "typeof", "decltype",
+    "static_cast", "dynamic_cast", "reinterpret_cast", "const_cast",
+    "alignof", "offsetof", "static_assert", "ASSERT",
+    "new", "delete", "try", "catch", "throw",
+}
+
+# 匹配标识符后跟左括号的模式（潜在的函数调用或宏调用）
+# 注意：这个正则会匹配所有函数调用，需要配合已知函数名做过滤
+_MACRO_CALL_RE = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+
+
+def _extract_macro_calls_for_function(
+    func: FunctionSymbol,
+    file_lines: list[str],
+    known_func_names: set[str],
+) -> list[RawCall]:
+    """
+    基于正则从函数体中提取潜在的宏调用。
+
+    策略：
+    1. 在函数行范围内搜索 identifier( 模式
+    2. 排除 C/C++ 关键字
+    3. 排除已知函数名（从 documentSymbol 提取的）
+    4. 剩余作为宏调用候选
+
+    Returns:
+        RawCall 列表（caller_index 需要外部填入）
+    """
+    raw_calls: list[RawCall] = []
+    start = max(0, func.start_line - 1)
+    end = min(len(file_lines), func.end_line)
+
+    for line_idx in range(start, end):
+        line = file_lines[line_idx]
+        # 跳过注释行和空行
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("*"):
+            continue
+
+        for match in _MACRO_CALL_RE.finditer(line):
+            name = match.group(1)
+            # 排除关键字和已知函数
+            if name in _CPP_KEYWORDS or name in known_func_names:
+                continue
+            # 排除看起来像类型转换的（如 (type)var）——这里简化处理
+            if name in {"char", "int", "float", "double", "void", "bool",
+                        "short", "long", "unsigned", "signed", "const", "struct", "class",
+                        "enum", "union", "template", "typename", "namespace", "using",
+                        "public", "private", "protected", "virtual", "override",
+                        "static", "extern", "inline", "constexpr", "consteval"}:
+                continue
+
+            raw_calls.append(RawCall(
+                caller_index=-1,  # 外部填入
+                callee_name=name,
+                file_path=func.file_path,
+                line=line_idx + 1,
+                callee_file_path=None,
+                callee_line=None,
+            ))
+
+    return raw_calls
+
+
 def process_file(
     lsp_request: callable,
     abs_path: str,
@@ -428,6 +504,8 @@ def process_file(
     collect_var_refs: bool = True,
     delay_between_calls: float = 0.02,
     lsp_notify: callable | None = None,
+    extract_macros: bool = True,
+    skip_vendor_calls: bool = True,
 ) -> FileResult:
     """
     处理单个文件：获取 documentSymbol、callHierarchy、references。
@@ -441,13 +519,19 @@ def process_file(
         collect_var_refs: 是否收集变量引用
         delay_between_calls: 每次 LSP 请求后的延迟
         lsp_notify: 发送 LSP notify 的函数（用于 didOpen/didClose）
+        extract_macros: 是否基于正则提取宏调用（补充 clangd 遗漏的宏）
+        skip_vendor_calls: 是否跳过 vendor 目录函数的 outgoingCalls
 
     Returns:
         FileResult
     """
     file_uri = _path_to_uri(abs_path)
 
+    # 判断是否为 vendor 文件
+    is_vendor = file_path.startswith("vendor/") or "/vendor/" in file_path
+
     # 先 didOpen 让 clangd 知道文件
+    content = ""
     if lsp_notify:
         try:
             content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
@@ -480,16 +564,30 @@ def process_file(
 
         # 2. outgoingCalls
         calls: list[RawCall] = []
+        should_skip_calls = is_vendor and skip_vendor_calls
         if collect_calls:
             for idx, fn in enumerate(functions):
                 raw = extract_calls_for_function(
                     lsp_request, file_uri, idx, fn, file_path,
                     repo_root=repo_root,
                     sleep_after=delay_between_calls,
+                    skip_outgoing=should_skip_calls,
                 )
                 calls.extend(raw)
 
-        # 3. var_refs（需要所有函数的列表做归属）
+        # 3. 宏调用提取（补充 clangd 遗漏的）
+        if extract_macros and not should_skip_calls and content:
+            file_lines = content.splitlines()
+            known_names = {f.name for f in functions}
+            for idx, fn in enumerate(functions):
+                macro_calls = _extract_macro_calls_for_function(
+                    fn, file_lines, known_names
+                )
+                for mc in macro_calls:
+                    mc.caller_index = idx
+                calls.extend(macro_calls)
+
+        # 4. var_refs（需要所有函数的列表做归属）
         var_refs_global: list[tuple[str, str, int]] = []
         if collect_var_refs and variables:
             for v in variables:

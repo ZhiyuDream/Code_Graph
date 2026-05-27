@@ -98,6 +98,8 @@ def run_full_pipeline(
     collect_calls: bool = True,
     collect_var_refs: bool = True,
     include_dirs: list[str] | None = None,
+    extract_macros: bool = True,
+    skip_vendor_calls: bool = True,
 ) -> dict[str, Any]:
     """
     执行全量建图 pipeline。
@@ -110,6 +112,8 @@ def run_full_pipeline(
         collect_calls: 是否收集 outgoingCalls
         collect_var_refs: 是否收集变量引用
         include_dirs: 若指定，只处理这些顶层目录下的文件
+        extract_macros: 是否基于正则提取宏调用（补充 clangd 遗漏）
+        skip_vendor_calls: 是否跳过 vendor 目录函数的 outgoingCalls
 
     Returns:
         统计信息 dict
@@ -156,6 +160,8 @@ def run_full_pipeline(
                     collect_var_refs=collect_var_refs,
                     delay_between_calls=0.0 if not collect_calls else 0.02,
                     lsp_notify=client.notify,
+                    extract_macros=extract_macros,
+                    skip_vendor_calls=skip_vendor_calls,
                 )
                 file_results.append(result)
             except Exception as e:
@@ -178,11 +184,22 @@ def run_full_pipeline(
     all_raw_calls: list[RawCall] = []
     all_var_refs: list[tuple[str, str, int]] = []
 
+    offset = 0
     for fr in file_results:
         for f in fr.functions:
             all_functions.append(f)
-        all_raw_calls.extend(fr.calls)
+        # caller_index 是文件内局部索引，需要转换为全局索引
+        for rc in fr.calls:
+            all_raw_calls.append(RawCall(
+                caller_index=rc.caller_index + offset,
+                callee_name=rc.callee_name,
+                file_path=rc.file_path,
+                line=rc.line,
+                callee_file_path=rc.callee_file_path,
+                callee_line=rc.callee_line,
+            ))
         all_var_refs.extend(fr.raw.get("var_refs_global", []))
+        offset += len(fr.functions)
 
     resolved = resolve_all_calls(all_functions, all_raw_calls)
 

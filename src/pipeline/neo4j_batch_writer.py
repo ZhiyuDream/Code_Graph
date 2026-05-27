@@ -20,7 +20,7 @@ BATCH_SIZE = 500
 
 def ensure_constraints(driver, database: str):
     """创建唯一性约束（若已存在会忽略）。"""
-    labels = ["Repository", "Directory", "File", "Function", "Class", "Variable", "Attribute"]
+    labels = ["Repository", "Directory", "File", "Function", "Class", "Variable", "Attribute", "Module"]
     with driver.session(database=database) as session:
         for label in labels:
             try:
@@ -33,7 +33,7 @@ def ensure_constraints(driver, database: str):
 
 def clear_code_graph(driver, database: str):
     """删除代码图相关节点（保留 Issue/PullRequest/Workflow）。"""
-    labels = ["Variable", "Function", "Class", "Attribute", "File", "Directory", "Repository"]
+    labels = ["Variable", "Function", "Class", "Attribute", "File", "Directory", "Repository", "Module"]
     with driver.session(database=database) as session:
         for label in labels:
             session.run(f"MATCH (n:{label}) DETACH DELETE n")
@@ -122,11 +122,11 @@ def write_graph(driver, graph: dict[str, Any], database: str):
 
     with driver.session(database=database) as session:
         # 写入节点（按标签分组）
-        for label in ["Repository", "Directory", "File", "Function", "Class", "Variable", "Attribute"]:
+        for label in ["Repository", "Directory", "File", "Function", "Class", "Variable", "Attribute", "Module"]:
             _batch_write_nodes(session, label, nodes.get(label, []))
 
         # 写入边（按关系类型分组，内部按标签再分）
-        for rel_type in ["CONTAINS", "CALLS", "CALLS_AMBIGUOUS", "REFERENCES_VAR", "HAS_MEMBER", "HAS_METHOD"]:
+        for rel_type in ["CONTAINS", "CALLS", "CALLS_AMBIGUOUS", "REFERENCES_VAR", "HAS_MEMBER", "HAS_METHOD", "BELONGS_TO", "MODULE_CALLS"]:
             _batch_write_edges(session, rel_type, edges.get(rel_type, []), id_to_label)
 
     total_nodes = sum(len(v) for v in nodes.values())

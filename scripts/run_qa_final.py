@@ -20,6 +20,7 @@ from tools.core import (
     get_neo4j_driver, close_neo4j_driver, run_cypher,
     call_llm, call_llm_json, generate_answer
 )
+from tools.core.prompt_loader import load_prompt
 from tools.search import (
     search_functions_by_text, expand_call_chain,
     search_issues, extract_entities_from_question, grep_codebase,
@@ -89,7 +90,9 @@ def initial_search(driver, client, question: str) -> dict:
     }
 
 
-def react_decide(client, question: str, collected: dict, step: int) -> dict:
+_REACT_DECIDE_PROMPT_TEMPLATE = "react_decide"
+
+def react_decide(client, question: str, collected: dict, step: int, prompt_template: str = None) -> dict:
     """ReAct决策：选择下一步行动"""
     funcs = collected.get("functions", [])
     chains = collected.get("call_chains", [])
@@ -123,7 +126,11 @@ def react_decide(client, question: str, collected: dict, step: int) -> dict:
     
     context = '\n'.join(context_lines)
     
-    prompt = f"""{context}
+    template = prompt_template or _REACT_DECIDE_PROMPT_TEMPLATE
+    
+    # 如果模板是内置的 baseline prompt，直接硬编码
+    if template == "react_decide_baseline":
+        prompt = f"""{context}
 
 ---
 
@@ -154,6 +161,18 @@ def react_decide(client, question: str, collected: dict, step: int) -> dict:
 }}
 
 只输出JSON:"""
+    else:
+        # 从外部文件加载 prompt
+        prompt = load_prompt(
+            template,
+            question=question,
+            context=context,
+            function_count=len(funcs),
+            function_list="\n".join(context_lines[1:]),
+            issue_count=len(issues),
+            chain_count=len(chains),
+            action_choices="expand_callers|expand_callees|sufficient"
+        )
     
     result = call_llm_json(
         messages=[{"role": "user", "content": prompt}],
@@ -200,7 +219,7 @@ def react_decide(client, question: str, collected: dict, step: int) -> dict:
     }
 
 
-def react_search(driver, client, question: str) -> dict:
+def react_search(driver, client, question: str, prompt_template: str = None) -> dict:
     """ReAct迭代检索主流程"""
     # 初始检索（已包含Grep Fallback）
     collected = initial_search(driver, client, question)
@@ -209,7 +228,7 @@ def react_search(driver, client, question: str) -> dict:
     
     # ReAct迭代
     for step in range(2, MAX_STEPS + 1):
-        decision = react_decide(client, question, collected, step)
+        decision = react_decide(client, question, collected, step, prompt_template)
         action = decision.get("action")
         target = decision.get("target", "")
         
@@ -254,7 +273,7 @@ def react_search(driver, client, question: str) -> dict:
     return collected
 
 
-def process_single(driver, client, row: dict, idx: int) -> dict:
+def process_single(driver, client, row: dict, idx: int, prompt_template: str = None) -> dict:
     """处理单个问题"""
     print(f"[{idx}] {row.get('具体问题', 'N/A')[:50]}...")
     
@@ -265,7 +284,7 @@ def process_single(driver, client, row: dict, idx: int) -> dict:
     
     try:
         # ReAct检索
-        collected = react_search(driver, client, question)
+        collected = react_search(driver, client, question, prompt_template)
         
         # 生成答案
         answer = generate_answer(question, collected)
@@ -301,6 +320,7 @@ def main():
     parser = argparse.ArgumentParser(description="V7 Final - Simplified QA")
     parser.add_argument("--csv", type=Path, required=True, help="输入CSV文件")
     parser.add_argument("--output", type=Path, required=True, help="输出JSON文件")
+    parser.add_argument("--prompt", type=str, default=None, help="ReAct决策prompt模板名 (如 react_decide_gpt54_style)")
     parser.add_argument("--workers", type=int, default=20, help="并行数")
     args = parser.parse_args()
     
@@ -311,6 +331,9 @@ def main():
         for row in reader:
             rows.append(row)
     
+    prompt_template = args.prompt
+    if prompt_template:
+        print(f"使用自定义prompt模板: {prompt_template}")
     print(f"共 {len(rows)} 题需要处理")
     
     # 连接Neo4j
@@ -326,7 +349,7 @@ def main():
     
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
-            executor.submit(process_single, driver, client, row, i): i
+            executor.submit(process_single, driver, client, row, i, prompt_template): i
             for i, row in enumerate(rows)
         }
         

@@ -21,6 +21,7 @@ sys.path.insert(0, str(_ROOT))
 from tools.core import get_neo4j_driver, close_neo4j_driver, generate_answer
 from tools.core.llm_client import call_llm_json
 from tools.core.prompt_loader import load_prompt, format_actions_for_prompt, get_action_names, get_action_impl
+from tools.core.react_actions import execute_action, get_registered_action_names
 from tools.search import (
     search_functions_by_text, expand_call_chain,
     expand_same_file, expand_same_class,
@@ -214,16 +215,20 @@ def react_decide(question: str, collected: dict, step: int, model: str, provider
     action = result.get("action", "")
     target = result.get("target", "")
     
-    valid_targets = [f['name'] for f in funcs[:8]]
-    if target not in valid_targets:
-        for f in funcs[:5]:
-            if f['name'] not in expanded:
-                target = f['name']
-                decision_trace["target_fallback"] = f"fallback to '{f['name']}'"
-                break
-        else:
-            target = funcs[0]['name'] if funcs else ""
-            decision_trace["target_fallback"] = "fallback to first function"
+    # 搜索类 action 的 target/query 可以是任意关键词，不需要在函数列表中
+    _SEARCH_ACTIONS_LOCAL = {"grep_search", "semantic_search"}
+    
+    if action not in _SEARCH_ACTIONS_LOCAL:
+        valid_targets = [f['name'] for f in funcs[:8]]
+        if target not in valid_targets:
+            for f in funcs[:5]:
+                if f['name'] not in expanded:
+                    target = f['name']
+                    decision_trace["target_fallback"] = f"fallback to '{f['name']}'"
+                    break
+            else:
+                target = funcs[0]['name'] if funcs else ""
+                decision_trace["target_fallback"] = "fallback to first function"
     
     valid_actions = get_action_names()
     if action not in valid_actions:
@@ -238,18 +243,8 @@ def react_decide(question: str, collected: dict, step: int, model: str, provider
     }, decision_trace
 
 
-def execute_action(action: str, target: str) -> dict:
-    """执行 ReAct action"""
-    if action == "expand_callers":
-        return expand_call_chain(target, "callers")
-    elif action == "expand_callees":
-        return expand_call_chain(target, "callees")
-    elif action == "expand_same_file":
-        return expand_same_file(target)
-    elif action == "expand_same_class":
-        return expand_same_class(target)
-    else:
-        return {"functions": [], "source": target, "type": "unknown"}
+# 搜索类 action 不需要函数列表中的 target
+_SEARCH_ACTIONS = {"grep_search", "semantic_search"}
 
 
 def react_search(driver, question: str, trace: dict, retrievers: set, repo_root: str, model: str, provider: str) -> tuple[dict, dict]:
@@ -265,6 +260,7 @@ def react_search(driver, question: str, trace: dict, retrievers: set, repo_root:
         
         action = decision.get("action")
         target = decision.get("target", "")
+        query = decision.get("query", "") or target  # 搜索类 action 使用 query 字段
         
         step_trace = {
             "step": step,
@@ -276,34 +272,42 @@ def react_search(driver, question: str, trace: dict, retrievers: set, repo_root:
             react_steps.append(step_trace)
             break
         
-        if target:
-            expansion = execute_action(action, target)
+        # 搜索类 action 可以用 query 作为输入，不需要 target 在函数列表中
+        is_search_action = action in _SEARCH_ACTIONS
+        
+        if target or is_search_action:
+            # 调用新的 action 执行器
+            new_functions = execute_action(
+                action=action,
+                target=target,
+                query=query,
+                repo_root=repo_root
+            )
             new_count = 0
-            for fn in expansion.get("functions", []):
+            for fn in new_functions:
                 if not any(f['name'] == fn['name'] for f in collected["functions"]):
                     fn['score'] = 0.5
-                    fn['source'] = f'{action}_of_{target}'
                     collected["functions"].append(fn)
                     new_count += 1
             
             collected["call_chains"].append({
-                "from": target,
+                "from": target or query,
                 "direction": action,
-                "found": len(expansion.get("functions", [])),
+                "found": len(new_functions),
                 "new": new_count
             })
             collected["steps"].append({
                 "step": step,
                 "action": action,
-                "target": target,
-                "found": len(expansion.get("functions", [])),
+                "target": target or query,
+                "found": len(new_functions),
                 "new": new_count
             })
             
             step_trace["expansion"] = {
                 "action": action,
-                "target": target,
-                "found": len(expansion.get("functions", [])),
+                "target": target or query,
+                "found": len(new_functions),
                 "new": new_count,
             }
             
@@ -329,7 +333,52 @@ def react_search(driver, question: str, trace: dict, retrievers: set, repo_root:
     return collected, trace
 
 
-def process_single(driver, row: dict, idx: int, retrievers: set, repo_root: str, model: str, provider: str) -> dict:
+def _compute_file_priority(fn: dict) -> float:
+    """计算文件优先级（用于选择读取哪些完整文件）。"""
+    source = fn.get('source', '') or 'embedding'
+    score = fn.get('score', 0)
+    if source in ('', 'embedding'):
+        return score * 100
+    elif source == 'grep_fallback':
+        return 45
+    elif 'caller' in source or 'callee' in source:
+        return 40
+    elif source == 'file_expansion':
+        return 30
+    else:
+        return 20
+
+
+def _collect_full_files(collected: dict, max_files: int = 10) -> dict:
+    """根据检索到的函数收集完整文件内容。"""
+    from collections import Counter
+    from tools.search.code_reader import read_full_file
+    
+    funcs = collected.get("functions", [])
+    if not funcs:
+        return collected
+    
+    # 统计每个文件涉及的函数数量，按相关性排序
+    file_counts = Counter()
+    for fn in funcs:
+        fp = fn.get('file', '')
+        if fp:
+            file_counts[fp] += _compute_file_priority(fn)
+    
+    # 取 top N 文件
+    top_files = [fp for fp, _ in file_counts.most_common(max_files)]
+    
+    full_files = {}
+    for fp in top_files:
+        content = read_full_file(fp)
+        if not content.startswith("// 文件不存在") and not content.startswith("// 读取文件失败"):
+            full_files[fp] = content
+    
+    collected["full_files"] = full_files
+    return collected
+
+
+def process_single(driver, row: dict, idx: int, retrievers: set, repo_root: str, model: str, provider: str, max_full_files: int = 10) -> dict:
     if idx % 20 == 0:
         print(f"[{idx}] {row.get('question', 'N/A')[:50]}...")
     
@@ -343,6 +392,10 @@ def process_single(driver, row: dict, idx: int, retrievers: set, repo_root: str,
     try:
         trace = {"index": idx, "question": question}
         collected, trace = react_search(driver, question, trace, retrievers, repo_root, model, provider)
+        
+        # 收集完整文件内容
+        collected = _collect_full_files(collected, max_files=max_full_files)
+        trace["full_files_count"] = len(collected.get("full_files", {}))
         
         answer = generate_answer(
             question=question,
@@ -378,6 +431,7 @@ def process_single(driver, row: dict, idx: int, retrievers: set, repo_root: str,
                 "function_count": len(collected.get("functions", [])),
                 "issue_count": len(collected.get("issues", [])),
                 "step_count": len(collected.get("steps", [])),
+                "full_files_count": len(collected.get("full_files", {})),
             },
             "trace": trace,
             "latency_s": latency,
@@ -395,6 +449,12 @@ def process_single(driver, row: dict, idx: int, retrievers: set, repo_root: str,
             "router": "V8_ReAct_Agent",
             "retrievers": list(retrievers),
             "error": str(e),
+            "retrieval": {
+                "function_count": 0,
+                "issue_count": 0,
+                "step_count": 0,
+                "full_files_count": 0,
+            },
             "trace": trace if 'trace' in dir() else {},
             "latency_s": time.time() - start_time,
             "usage": usage_stats,
@@ -412,6 +472,7 @@ def main():
     parser.add_argument("-w", "--workers", type=int, default=20, help="并行 worker 数")
     parser.add_argument("--limit", type=int, default=0, help="只跑前 N 条")
     parser.add_argument("--offset", type=int, default=0, help="从第 N 条开始跑")
+    parser.add_argument("--max-full-files", type=int, default=10, help="每题最多读取多少个完整文件 (默认10)")
     args = parser.parse_args()
     
     # 加载 benchmark
@@ -433,6 +494,7 @@ def main():
     print(f"模型: {args.model} ({args.provider})")
     print(f"ReAct actions: {', '.join(get_action_names())}")
     print(f"并行: {args.workers} workers")
+    print(f"完整文件: 每题最多 {args.max_full_files} 个")
     print(f"估算耗时: ~{len(rows) * 60 / args.workers / 60:.0f} 分钟")
     print()
     
@@ -443,7 +505,7 @@ def main():
     
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
-            executor.submit(process_single, driver, row, i, retrievers, repo_root, args.model, args.provider): i
+            executor.submit(process_single, driver, row, i, retrievers, repo_root, args.model, args.provider, args.max_full_files): i
             for i, row in enumerate(rows)
         }
         

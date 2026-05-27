@@ -154,13 +154,13 @@ def enrich_function_with_code(func: Dict) -> Dict:
     if existing_text and len(existing_text) > 200:
         return func
     
-    # 从文件读取代码
+    # 从文件读取代码（取消30行限制，信任start_line/end_line或函数名定位）
     code = read_function_from_file(
         file_path=file_path,
         func_name=func_name,
         start_line=start_line,
         end_line=end_line,
-        max_lines=30
+        max_lines=200
     )
     
     if code and not code.startswith('//'):
@@ -168,6 +168,31 @@ def enrich_function_with_code(func: Dict) -> Dict:
         func['code_enriched'] = True
     
     return func
+
+
+def read_full_file(file_path: str) -> str:
+    """
+    读取完整源文件内容
+    
+    Args:
+        file_path: 文件路径（相对 REPO_ROOT 或绝对路径）
+        
+    Returns:
+        文件完整内容
+    """
+    if not file_path.startswith('/'):
+        full_path = REPO_ROOT / file_path
+    else:
+        full_path = Path(file_path)
+    
+    if not full_path.exists():
+        return f"// 文件不存在: {file_path}"
+    
+    try:
+        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+    except Exception as e:
+        return f"// 读取文件失败: {e}"
 
 
 def batch_enrich_functions(functions: list) -> list:

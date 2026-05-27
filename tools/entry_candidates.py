@@ -1,14 +1,12 @@
+from __future__ import annotations
+
 import sys
 from pathlib import Path
-_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_ROOT / "src"))   # 核心库
-sys.path.insert(0, str(_ROOT))             # 根目录（config.py）
 
 """
 阶段 2：入口候选发现。从 Neo4j 通过图结构（无 CALLS 入边的 Function）得到入口函数列表。
 不定死规则，后续可接入 agent（读文档、grep 等）再筛或增补。
 """
-from __future__ import annotations
 
 from typing import Any
 

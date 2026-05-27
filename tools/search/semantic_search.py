@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..core.llm_client import get_llm_client
 from .code_reader import enrich_function_with_code
+from .frequency_penalty import apply_penalty, DEFAULT_PENALTY
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 _RAG_INDEX = None
@@ -81,18 +82,44 @@ def search_functions_by_text(
     scores.sort(key=lambda x: -x[0])
     
     results = []
-    for sim, chunk in scores[:top_k]:
+    for sim, chunk in scores[:top_k * 2]:  # 先取更多，降权后再截断
         meta = chunk.get("meta", {})
         func = {
             'name': meta.get('name', ''),
             'file': meta.get('file', ''),
             'text': chunk.get('text', ''),
             'score': sim,
-            'start_line': meta.get('line', 0),
-            'end_line': meta.get('line', 0) + 30  # 估算结束行
+            'start_line': meta.get('start_line', meta.get('line', 0)),
+            'end_line': meta.get('end_line', meta.get('line', 0))  # 信任 RAG index 的精确 end_line
         }
         # 补充完整代码
         func = enrich_function_with_code(func)
         results.append(func)
     
-    return results
+    # 去重：同名函数优先保留 text 更长的（实现 vs 声明）
+    seen_names = {}
+    deduped = []
+    for func in results:
+        name = func.get('name', '')
+        if not name:
+            deduped.append(func)
+            continue
+        if name in seen_names:
+            # 保留 text 更长的（通常是实现而非声明）
+            existing = seen_names[name]
+            if len(func.get('text', '')) > len(existing.get('text', '')):
+                # 替换已有记录
+                for i, f in enumerate(deduped):
+                    if f.get('name') == name:
+                        deduped[i] = func
+                        seen_names[name] = func
+                        break
+        else:
+            seen_names[name] = func
+            deduped.append(func)
+    results = deduped
+    
+    # 高频函数降权（P2 优化）
+    results = apply_penalty(results, penalty=DEFAULT_PENALTY)
+    
+    return results[:top_k]

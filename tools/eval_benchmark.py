@@ -245,10 +245,10 @@ def evaluate_item(client, item: dict, binary_only: bool = False) -> dict:
     """
     评估单个题目
     """
-    # 获取字段并确保是字符串
-    question = str(item.get("具体问题", "") or "")
-    reference = str(item.get("参考答案", "") or "")
-    generated = str(item.get("生成答案", "") or "")
+    # 获取字段并确保是字符串（支持多种字段名格式）
+    question = str(item.get("question", "") or item.get("具体问题", "") or "")
+    reference = str(item.get("reference", "") or item.get("参考答案", "") or "")
+    generated = str(item.get("generated", "") or item.get("生成答案", "") or "")
     
     # 处理可能的非字符串类型（如 NaN, float 等）
     if question.lower() in ('nan', 'none', 'null'):
