@@ -163,6 +163,20 @@ def react_decide(client, question: str, collected: dict, step: int, prompt_templ
 只输出JSON:"""
     else:
         # 从外部文件加载 prompt
+        # 构建 issue_list 和 chain_list
+        issue_lines = []
+        for i, issue in enumerate(issues[:3]):
+            issue_lines.append(f"{i+1}. #{issue['number']}: {issue['title'][:80]}")
+        issue_list = "\n".join(issue_lines) if issue_lines else "无"
+
+        chain_lines = []
+        for c in chains[-3:]:
+            chain_lines.append(f"  - {c['from']}: {c['direction']} (找到{c['found']}个, 新增{c['new']}个)")
+        chain_list = "\n".join(chain_lines) if chain_lines else "无"
+
+        from src.core.prompt_loader import format_actions_for_prompt
+        actions = format_actions_for_prompt()
+
         prompt = load_prompt(
             template,
             question=question,
@@ -170,7 +184,10 @@ def react_decide(client, question: str, collected: dict, step: int, prompt_templ
             function_count=len(funcs),
             function_list="\n".join(context_lines[1:]),
             issue_count=len(issues),
+            issue_list=issue_list,
             chain_count=len(chains),
+            chain_list=chain_list,
+            actions=actions,
             action_choices="expand_callers|expand_callees|sufficient"
         )
     
