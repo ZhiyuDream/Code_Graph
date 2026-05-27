@@ -89,6 +89,7 @@ def search_functions_by_text(
             'file': meta.get('file', ''),
             'text': chunk.get('text', ''),
             'score': sim,
+            'source': 'embedding',
             'start_line': meta.get('start_line', meta.get('line', 0)),
             'end_line': meta.get('end_line', meta.get('line', 0))  # 信任 RAG index 的精确 end_line
         }

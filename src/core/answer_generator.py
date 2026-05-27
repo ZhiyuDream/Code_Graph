@@ -27,7 +27,15 @@ def build_context(collected: Dict) -> str:
         for i, fn in enumerate(high_rel[:5], 1):
             lines.append(f"{i}. {fn['name']} @ {fn['file']}")
             if fn.get('text'):
-                lines.append(f"   代码: {fn['text'][:150]}")
+                lines.append(f"   代码:\n{fn['text']}")
+
+    # Embedding 检索结果（所有，含低分）
+    if embedding_funcs and not high_rel:
+        lines.append("【Embedding检索函数】")
+        for i, fn in enumerate(embedding_funcs[:5], 1):
+            lines.append(f"{i}. {fn['name']} @ {fn['file']} (相似度: {fn.get('score', 0):.3f})")
+            if fn.get('text'):
+                lines.append(f"   代码:\n{fn['text']}")
     
     # Grep fallback 函数
     if grep_funcs:
@@ -35,25 +43,23 @@ def build_context(collected: Dict) -> str:
         for i, fn in enumerate(grep_funcs[:3], 1):
             lines.append(f"{i}. {fn['name']} @ {fn['file']}")
             if fn.get('text'):
-                lines.append(f"   代码: {fn['text'][:150]}")
+                lines.append(f"   代码:\n{fn['text']}")
     
     # 文件级扩展的函数
     if file_exp_funcs:
         lines.append(f"\n【同文件相关函数】(文件级扩展发现)")
-        for i, fn in enumerate(file_exp_funcs[:10], 1):  # 增加到前10个
+        for i, fn in enumerate(file_exp_funcs[:10], 1):
             lines.append(f"{i}. {fn['name']} @ {fn['file']}")
             if fn.get('text'):
-                # 增加代码片段长度，避免丢失关键信息
-                code = fn['text'][:500]  # 从100增加到500字符
-                if len(fn['text']) > 500:
-                    code += "...(截断)"
-                lines.append(f"   代码: {code}")
+                lines.append(f"   代码:\n{fn['text']}")
     
     # 调用链扩展的函数
     if chain_funcs:
         lines.append(f"\n【调用链相关函数】(通过ReAct扩展发现)")
         for i, fn in enumerate(chain_funcs[:5], 1):
-            lines.append(f"{i}. {fn['name']} [{fn.get('source')}]")
+            lines.append(f"{i}. {fn['name']} @ {fn.get('file', '?')} [{fn.get('source')}]")
+            if fn.get('text'):
+                lines.append(f"   代码:\n{fn['text']}")
     
     # Issue信息
     if issues:
