@@ -33,10 +33,54 @@ MAX_STEPS = 5
 FALLBACK_THRESHOLD = 0.5
 
 
+def _extract_target_function(question: str) -> str:
+    """从问题中提取目标函数名（反引号内的内容）"""
+    if '`' in question:
+        parts = question.split('`')
+        if len(parts) >= 2:
+            return parts[1]
+    return ''
+
+
+def _lookup_by_name(func_name: str) -> list:
+    """从 RAG index 按函数名直接查找"""
+    from src.search.semantic_search import _load_rag_index
+    idx = _load_rag_index()
+    if not idx:
+        return []
+    results = []
+    for c in idx['chunks']:
+        if c['type'] == 'function' and c.get('meta', {}).get('name') == func_name:
+            from src.search.code_reader import enrich_function_with_code
+            func = {
+                'name': func_name,
+                'file': c['meta'].get('file', ''),
+                'text': c.get('text', ''),
+                'score': 1.0,
+                'source': 'name_lookup',
+                'start_line': c['meta'].get('start_line', 0),
+                'end_line': c['meta'].get('end_line', 0),
+            }
+            func = enrich_function_with_code(func)
+            results.append(func)
+    return results
+
+
 def initial_search(driver, client, question: str) -> dict:
-    """初始检索：语义搜索 + Grep Fallback + Issue搜索"""
-    # 语义搜索
-    funcs = search_functions_by_text(question, top_k=5)
+    """初始检索：目标函数直接查找 + 语义搜索 + Grep Fallback + Issue搜索"""
+    # 1. 如果问题提到具体函数名，直接按名字查找
+    target_name = _extract_target_function(question)
+    funcs = []
+    if target_name:
+        funcs = _lookup_by_name(target_name)
+        if funcs:
+            print(f"      直接查找到目标函数: {target_name}")
+
+    # 2. 语义搜索
+    semantic_funcs = search_functions_by_text(question, top_k=5)
+    for f in semantic_funcs:
+        if not any(existing['name'] == f['name'] for existing in funcs):
+            funcs.append(f)
     
     # 检查是否需要Grep Fallback
     max_score = max([f.get('score', 0) for f in funcs], default=0)
