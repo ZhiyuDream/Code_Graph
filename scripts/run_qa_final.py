@@ -343,18 +343,32 @@ def process_single(driver, client, row: dict, idx: int, prompt_template: str = N
         
         latency = time.time() - start_time
         
+        # 记录每步召回的函数详情
+        from src.core.llm_client import get_usage_stats
+        usage = get_usage_stats()
+
         return {
             "index": idx,
             "具体问题": question,
             "参考答案": row.get('答案', ''),
             "生成答案": answer,
             "路由类型": "V7_Final",
-            "检索结果": {
-                "function_count": len(collected.get("functions", [])),
-                "issue_count": len(collected.get("issues", [])),
-                "step_count": len(collected.get("steps", []))
+            "检索详情": {
+                "steps": collected.get("steps", []),
+                "functions": [
+                    {"name": f.get("name"), "file": f.get("file"),
+                     "source": f.get("source"), "score": round(f.get("score", 0), 3),
+                     "text_len": len(f.get("text", ""))}
+                    for f in collected.get("functions", [])
+                ],
+                "issues": [
+                    {"number": i.get("number"), "title": i.get("title")}
+                    for i in collected.get("issues", [])
+                ],
+                "call_chains": collected.get("call_chains", []),
             },
-            "延迟_s": latency
+            "延迟_s": latency,
+            "token_usage": usage
         }
         
     except Exception as e:
