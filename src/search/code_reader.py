@@ -134,27 +134,27 @@ def _extract_function_by_name(lines: list, func_name: str, max_lines: int = 50) 
 def enrich_function_with_code(func: Dict) -> Dict:
     """
     为函数信息补充完整代码
-    
+
     Args:
         func: 包含 name, file, start_line, end_line 的字典
-        
+
     Returns:
         补充了 code 字段的字典
     """
     if not func:
         return func
-    
+
     file_path = func.get('file', '')
     func_name = func.get('name', '')
     start_line = func.get('start_line')
     end_line = func.get('end_line')
-    
+
     # 如果已经有文本且足够长，直接使用
     existing_text = func.get('text', '')
     if existing_text and len(existing_text) > 200:
         return func
-    
-    # 从文件读取代码（取消30行限制，信任start_line/end_line或函数名定位）
+
+    # 从文件读取代码
     code = read_function_from_file(
         file_path=file_path,
         func_name=func_name,
@@ -162,11 +162,22 @@ def enrich_function_with_code(func: Dict) -> Dict:
         end_line=end_line,
         max_lines=200
     )
-    
+
+    # 如果从 .h 文件只拿到声明（很短），尝试找对应的 .cpp 实现
+    if code and file_path.endswith('.h') and len(code) < 150:
+        cpp_path = file_path.rsplit('.h', 1)[0] + '.cpp'
+        cpp_code = read_function_from_file(
+            file_path=cpp_path,
+            func_name=func_name,
+            max_lines=200
+        )
+        if cpp_code and not cpp_code.startswith('//') and len(cpp_code) > len(code):
+            code = cpp_code
+
     if code and not code.startswith('//'):
         func['text'] = code
         func['code_enriched'] = True
-    
+
     return func
 
 

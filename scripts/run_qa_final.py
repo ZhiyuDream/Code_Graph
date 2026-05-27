@@ -24,7 +24,8 @@ from src.core.prompt_loader import load_prompt
 from src.search import (
     search_functions_by_text, expand_call_chain,
     search_issues, extract_entities_from_question, grep_codebase,
-    convert_grep_to_function_results, search_module_functions
+    convert_grep_to_function_results, search_module_functions,
+    expand_same_file, expand_same_class
 )
 
 # 常量
@@ -222,71 +223,105 @@ def react_decide(client, question: str, collected: dict, step: int, prompt_templ
             target = funcs[0]['name'] if funcs else ""
     
     # 统计
+    valid_actions = ["expand_callers", "expand_callees", "expand_same_file",
+                     "expand_same_class", "grep_search", "semantic_search", "sufficient"]
     react_decide.stats["total"] += 1
-    final_action = action if action in ["expand_callers", "expand_callees"] else "expand_callees"
+    final_action = action if action in valid_actions else "sufficient"
     if final_action != action:
         react_decide.stats["default_used"] += 1
     react_decide.stats["actions"][final_action] = react_decide.stats["actions"].get(final_action, 0) + 1
-    
+
     return {
         "thought": result.get("thought", ""),
-        "sufficient": False,
+        "sufficient": final_action == "sufficient",
         "action": final_action,
         "target": target
     }
+
+
+def _add_new_funcs(collected, new_funcs, source_tag):
+    """去重并添加新函数到 collected，返回新增数量"""
+    new_count = 0
+    for fn in new_funcs:
+        if not any(f['name'] == fn['name'] for f in collected["functions"]):
+            fn['score'] = fn.get('score', 0.5)
+            fn['source'] = source_tag
+            collected["functions"].append(fn)
+            new_count += 1
+    return new_count
 
 
 def react_search(driver, client, question: str, prompt_template: str = None) -> dict:
     """ReAct迭代检索主流程"""
     # 初始检索（已包含Grep Fallback）
     collected = initial_search(driver, client, question)
-    
+
     info_gain_history = []
-    
+
     # ReAct迭代
     for step in range(2, MAX_STEPS + 1):
         decision = react_decide(client, question, collected, step, prompt_template)
         action = decision.get("action")
         target = decision.get("target", "")
-        
+
         if decision.get("sufficient") or action == "sufficient":
             break
-        
+
+        new_count = 0
+        found = 0
+
         if action in ["expand_callers", "expand_callees"] and target:
             direction = "callers" if action == "expand_callers" else "callees"
             chain = expand_call_chain(target, direction)
-            
-            new_count = 0
-            for fn in chain["functions"]:
-                if not any(f['name'] == fn['name'] for f in collected["functions"]):
-                    fn['score'] = 0.5
-                    fn['source'] = f'{direction}_of_{target}'
-                    collected["functions"].append(fn)
-                    new_count += 1
-            
+            found = len(chain["functions"])
+            new_count = _add_new_funcs(collected, chain["functions"], f'{direction}_of_{target}')
             collected["call_chains"].append({
-                "from": target,
-                "direction": direction,
-                "found": len(chain["functions"]),
-                "new": new_count
+                "from": target, "direction": direction,
+                "found": found, "new": new_count
             })
-            
-            # 记录步骤
-            collected["steps"].append({
-                "step": step,
-                "action": action,
-                "target": target,
-                "found": len(chain["functions"]),
-                "new": new_count
-            })
-            
-            info_gain_history.append(new_count)
-            
-            # 递减回报检测
-            if step >= 3 and len(info_gain_history) >= 2:
-                if all(g <= 1 for g in info_gain_history[-2:]):
-                    break
-    
+
+        elif action == "expand_same_file" and target:
+            # 找到目标函数所在的文件
+            target_func = next((f for f in collected["functions"] if f['name'] == target), None)
+            if target_func:
+                file_path = target_func.get('file', '')
+                neighbors = expand_same_file(target, file_path)
+                found = len(neighbors)
+                new_count = _add_new_funcs(collected, neighbors, 'file_expansion')
+
+        elif action == "expand_same_class" and target:
+            target_func = next((f for f in collected["functions"] if f['name'] == target), None)
+            if target_func:
+                file_path = target_func.get('file', '')
+                class_members = expand_same_class(target, file_path)
+                found = len(class_members)
+                new_count = _add_new_funcs(collected, class_members, 'class_expansion')
+
+        elif action == "grep_search" and target:
+            grep_results = grep_codebase(target, limit=5)
+            found = len(grep_results)
+            if grep_results:
+                new_funcs = convert_grep_to_function_results(grep_results)
+                new_count = _add_new_funcs(collected, new_funcs, 'grep_react')
+
+        elif action == "semantic_search" and target:
+            new_funcs = search_functions_by_text(target, top_k=5)
+            found = len(new_funcs)
+            new_count = _add_new_funcs(collected, new_funcs, 'semantic_react')
+
+        # 记录步骤
+        collected["steps"].append({
+            "step": step, "action": action, "target": target,
+            "found": found, "new": new_count
+        })
+
+        info_gain_history.append(new_count)
+
+        # 递减回报检测
+        if step >= 3 and len(info_gain_history) >= 2:
+            if all(g <= 1 for g in info_gain_history[-2:]):
+                break
+
     return collected
 
 
