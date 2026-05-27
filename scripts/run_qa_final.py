@@ -16,12 +16,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from tools.core import (
+from src.core import (
     get_neo4j_driver, close_neo4j_driver, run_cypher,
     call_llm, call_llm_json, generate_answer
 )
-from tools.core.prompt_loader import load_prompt
-from tools.search import (
+from src.core.prompt_loader import load_prompt
+from src.search import (
     search_functions_by_text, expand_call_chain,
     search_issues, extract_entities_from_question, grep_codebase,
     convert_grep_to_function_results, search_module_functions
@@ -340,7 +340,7 @@ def main():
     driver = get_neo4j_driver()
     
     # 从core模块导入client
-    from tools.core.llm_client import get_llm_client
+    from src.core.llm_client import get_llm_client
     client = get_llm_client()
     
     # 并行处理

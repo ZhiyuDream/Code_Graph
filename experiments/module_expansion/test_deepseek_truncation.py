@@ -15,14 +15,14 @@ sys.path.insert(0, str(_ROOT))
 
 os.environ['LLM_MODEL'] = 'deepseek-v4-pro'
 
-from tools.core import get_neo4j_driver, close_neo4j_driver, generate_answer
-from tools.search import (
+from src.core import get_neo4j_driver, close_neo4j_driver, generate_answer
+from src.search import (
     search_functions_by_text, expand_call_chain,
     search_issues, extract_entities_from_question,
     convert_grep_to_function_results, search_module_functions,
 )
-from tools.search.grep_search_v2 import grep_codebase
-from tools.search.semantic_search import _load_rag_index
+from src.search.grep_search_v2 import grep_codebase
+from src.search.semantic_search import _load_rag_index
 
 MAX_STEPS = 5
 FALLBACK_THRESHOLD = 0.5
@@ -151,7 +151,7 @@ indices = json.load(open('/tmp/deepseek_trunc_test_indices.json'))
 idx_to_row = {int(r['index']): r for r in rows}
 
 driver = get_neo4j_driver()
-from tools.core.llm_client import get_llm_client
+from src.core.llm_client import get_llm_client
 client = get_llm_client(provider='deepseek')
 
 print("=" * 60)

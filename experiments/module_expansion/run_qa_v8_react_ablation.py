@@ -18,18 +18,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from tools.core import get_neo4j_driver, close_neo4j_driver, generate_answer
-from tools.core.llm_client import call_llm_json
-from tools.core.prompt_loader import load_prompt, format_actions_for_prompt, get_action_names, get_action_impl
-from tools.core.react_actions import execute_action, get_registered_action_names
-from tools.search import (
+from src.core import get_neo4j_driver, close_neo4j_driver, generate_answer
+from src.core.llm_client import call_llm_json
+from src.core.prompt_loader import load_prompt, format_actions_for_prompt, get_action_names, get_action_impl
+from src.core.react_actions import execute_action, get_registered_action_names
+from src.search import (
     search_functions_by_text, expand_call_chain,
     expand_same_file, expand_same_class,
     search_issues, extract_entities_from_question,
     convert_grep_to_function_results, search_module_functions,
 )
-from tools.search.grep_search_v2 import grep_codebase
-from tools.search.semantic_search import _load_rag_index
+from src.search.grep_search_v2 import grep_codebase
+from src.search.semantic_search import _load_rag_index
 from qa_framework.retrievers.graph_retriever import GraphRetriever
 from config import NEO4J_DATABASE, REPO_ROOT, LLM_MODEL, OPENAI_BASE_URL
 
@@ -352,7 +352,7 @@ def _compute_file_priority(fn: dict) -> float:
 def _collect_full_files(collected: dict, max_files: int = 10) -> dict:
     """根据检索到的函数收集完整文件内容。"""
     from collections import Counter
-    from tools.search.code_reader import read_full_file
+    from src.search.code_reader import read_full_file
     
     funcs = collected.get("functions", [])
     if not funcs:
@@ -383,7 +383,7 @@ def process_single(driver, row: dict, idx: int, retrievers: set, repo_root: str,
         print(f"[{idx}] {row.get('question', 'N/A')[:50]}...")
     
     # 重置 token usage 统计
-    from tools.core.llm_client import reset_usage_stats, get_usage_stats
+    from src.core.llm_client import reset_usage_stats, get_usage_stats
     reset_usage_stats()
     
     start_time = time.time()

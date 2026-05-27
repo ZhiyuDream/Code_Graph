@@ -18,16 +18,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from tools.core import (
+from src.core import (
     get_neo4j_driver, close_neo4j_driver,
     call_llm, call_llm_json, generate_answer
 )
-from tools.search import (
+from src.search import (
     search_functions_by_text,
     search_issues, extract_entities_from_question, grep_codebase,
     convert_grep_to_function_results, search_module_functions,
 )
-from tools.search.semantic_search import _load_rag_index
+from src.search.semantic_search import _load_rag_index
 
 MAX_STEPS = 1  # 只运行1步（初始搜索），不进入ReAct循环
 FALLBACK_THRESHOLD = 0.5
@@ -187,7 +187,7 @@ def main():
     print(f"模式: 无Neo4j扩展 + {'文件扩展' if args.file_expansion else '无扩展'}")
     
     driver = get_neo4j_driver()
-    from tools.core.llm_client import get_llm_client
+    from src.core.llm_client import get_llm_client
     client = get_llm_client()
     
     results = []

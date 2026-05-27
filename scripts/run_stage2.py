@@ -19,7 +19,7 @@ if str(_CODE_GRAPH) not in sys.path:
     sys.path.insert(0, str(_CODE_GRAPH))
 
 from config import NEO4J_DATABASE
-from tools.entry_candidates import get_entry_candidates
+from src.workflow.entry_candidates import get_entry_candidates
 from src.neo4j_writer import get_driver
 from src.workflow_expand import expand_all_entries
 from src.workflow_writer import clear_workflows, ensure_workflow_constraint, write_workflows

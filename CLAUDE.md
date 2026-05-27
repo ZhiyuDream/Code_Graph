@@ -35,14 +35,33 @@ python tools/eval_benchmark.py compare -b baseline.json -n new_result.json
 pytest tests/
 
 # Debug a single question
-python debug_single_question.py
+python scripts/debug_single_question.py
 ```
 
 ## Architecture
 
+### Project Layout
+
+```
+config.py               # Central config loader (from .env)
+src/                    # All importable library code
+  pipeline/             # Stage 1 clangd-based graph building
+  core/                 # Infrastructure: neo4j_client, llm_client, prompt_loader, answer_generator
+  search/               # Retrieval: semantic_search, call_chain, grep_search_v2, code_reader
+  qa/                   # QA agent (agent.py) and classic RAG (classic_rag.py)
+  workflow/             # Workflow discovery (entry_candidates)
+  neo4j_writer.py       # Shared Neo4j constraint/write utilities
+scripts/                # CLI entry points (run_stage*.py, run_qa_final.py, eval tools)
+experiments/            # Experiment scripts and results
+prompts/                # LLM prompt templates (loaded by src/core/prompt_loader.py)
+datasets/               # QA benchmarks
+tests/                  # Unit tests
+data/                   # RAG indexes (gitignored, ~1.1GB)
+```
+
 ### Pipeline (src/pipeline/) -- Graph Building
 
-The active code path for Stage 1. Orchestrated by `stage1_clangd.py`:
+Orchestrated by `stage1_clangd.py`:
 
 `LSPClient` (clangd JSON-RPC) -> `symbol_extractor` (documentSymbol + callHierarchy) -> `field_resolver` -> `call_resolver` (RawCall -> precise caller/callee pairs) -> `graph_assembler` (builds nodes/edges dict with Louvain community detection for Modules) -> `neo4j_batch_writer` (UNWIND batch write, 500/batch)
 
@@ -54,21 +73,21 @@ Node types: Repository, Directory, File, Function, Class, Variable, Attribute, M
 
 Edge types: CONTAINS, CALLS, CALLS_AMBIGUOUS, REFERENCES_VAR, HAS_MEMBER, HAS_METHOD, BELONGS_TO, MODULE_CALLS, FIXES, WORKFLOW_ENTRY, PART_OF_WORKFLOW, CHANGED_IN, MENTIONS
 
-### tools/ -- QA Retrieval and Generation
+### src/core/ -- Infrastructure Layer
 
-**tools/core/** -- Infrastructure layer:
 - `neo4j_client.py` -- Singleton driver, `run_cypher()`, `run_cypher_single()`
 - `llm_client.py` -- Multi-provider LLM (OpenAI/DeepSeek), `call_llm()` with retry, `call_llm_json()` with json_repair
 - `answer_generator.py` -- `build_context()` + `generate_answer()`
 - `prompt_loader.py` -- Loads templates from `prompts/` directory
 - `react_actions.py` -- ReAct action registry and executor
 
-**tools/search/** -- 3-layer search:
+### src/search/ -- 3-Layer Search
+
 1. `semantic_search.py` -- Embedding-based search using precomputed RAG index (`data/qa_embedding_index.json`)
 2. `call_chain.py` -- Neo4j graph traversal (expand callers/callees)
 3. `grep_search_v2.py` -- Keyword-based code search with grep
 
-Other search tools: `file_neighbors.py` (same-file/same-class expansion), `issue_search.py` (GitHub Issues/PRs), `code_reader.py` (read source from files), `frequency_penalty.py` (high-freq function filtering).
+Other: `file_neighbors.py` (same-file/same-class expansion), `issue_search.py` (GitHub Issues/PRs), `code_reader.py` (read source from files), `frequency_penalty.py` (high-freq function filtering).
 
 ### ReAct Agent Loop (scripts/run_qa_final.py)
 
@@ -78,19 +97,11 @@ Iterative retrieval with up to 5 rounds:
 3. **Expand**: Neo4j call chain expansion; stops early on diminishing returns (2 rounds with gain <= 1)
 4. **Answer**: Generate final answer via `generate_answer()`
 
-### src/ -- Supporting Modules
-
-- `workflow_expand.py` / `workflow_writer.py` -- Stage 2 BFS workflow discovery
-- `github_fetcher.py` / `import_github_to_graph.py` / `issue_pr_writer.py` -- Stage 3 GitHub data
-- `neo4j_writer.py` -- Shared Neo4j constraint/write utilities
-- `parsers/` -- Pluggable parser architecture (base.py, cpp_parser.py, python_parser.py)
-
 ## Conventions
 
-- Prompts are file-based in `prompts/`, loaded at runtime by `tools/core/prompt_loader.py`. Edit prompt files, not inline strings.
+- Prompts are file-based in `prompts/`, loaded at runtime by `src/core/prompt_loader.py`. Edit prompt files, not inline strings.
 - Parallelism: Use `ThreadPoolExecutor` with `--workers 20` for QA and evaluation.
 - Experiment results go in `results/` (gitignored). Record improvements in `design/` with good/bad cases.
-- The codebase is actively versioned (P0 -> V7 -> V8). Root-level `run_qa_*.py` / `v8_*.py` files are experiment scripts; `scripts/run_qa_final.py` is the canonical entry point.
 - Documentation and comments are primarily in Chinese.
-- LLM calls go through `tools/core/llm_client.py` -- never call the OpenAI SDK directly.
-- Neo4j queries go through `tools/core/neo4j_client.py` -- never create drivers directly.
+- LLM calls go through `src/core/llm_client.py` -- never call the OpenAI SDK directly.
+- Neo4j queries go through `src/core/neo4j_client.py` -- never create drivers directly.

@@ -23,17 +23,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from tools.core import (
+from src.core import (
     get_neo4j_driver, close_neo4j_driver,
     call_llm, call_llm_json, generate_answer
 )
-from tools.search import (
+from src.search import (
     search_functions_by_text, expand_call_chain,
     search_issues, grep_codebase,
     convert_grep_to_function_results, search_module_functions,
 )
-from tools.search.semantic_search import _load_rag_index
-from tools.search.query_rewriter import get_grep_keywords, rewrite_query
+from src.search.semantic_search import _load_rag_index
+from src.search.query_rewriter import get_grep_keywords, rewrite_query
 
 # 常量
 MAX_STEPS = 5
@@ -178,7 +178,7 @@ def initial_search_with_rewrite(
         print(f"    [Fallback] 触发传统Fallback (max_score={max_score:.2f})")
         
         # 传统实体提取
-        from tools.search import extract_entities_from_question
+        from src.search import extract_entities_from_question
         entities = extract_entities_from_question(question)
         
         for entity in entities[:2]:
@@ -432,7 +432,7 @@ def main():
     # 连接Neo4j
     driver = get_neo4j_driver()
     
-    from tools.core.llm_client import get_llm_client
+    from src.core.llm_client import get_llm_client
     client = get_llm_client()
     
     # 并行处理

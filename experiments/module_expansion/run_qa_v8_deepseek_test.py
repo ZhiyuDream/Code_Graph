@@ -19,17 +19,17 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from pathlib import Path
-from tools.core import (
+from src.core import (
     get_neo4j_driver, close_neo4j_driver, generate_answer
 )
-from tools.search import (
+from src.search import (
     search_functions_by_text, expand_call_chain,
     search_issues, extract_entities_from_question,
     convert_grep_to_function_results, search_module_functions,
     semantic_search as semantic_search_func
 )
-from tools.search.grep_search_v2 import grep_codebase
-from tools.search.semantic_search import _load_rag_index
+from src.search.grep_search_v2 import grep_codebase
+from src.search.semantic_search import _load_rag_index
 
 # 常量
 MAX_STEPS = 5
@@ -176,7 +176,7 @@ def react_decide(client, question: str, collected: dict, step: int) -> dict:
 }}
 
 只输出JSON:"""
-    from tools.core.llm_client import call_llm_json
+    from src.core.llm_client import call_llm_json
     result = call_llm_json(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=300,
@@ -299,7 +299,7 @@ def main():
     print()
     
     driver = get_neo4j_driver()
-    from tools.core.llm_client import get_llm_client
+    from src.core.llm_client import get_llm_client
     client = get_llm_client(provider='deepseek')
     
     results = []

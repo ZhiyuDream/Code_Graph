@@ -4,13 +4,14 @@
 """
 
 import sys
-sys.path.insert(0, '/data/yulin/RUC/Code_Graph')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import json
 import networkx as nx
 from collections import defaultdict
-from tools.core import get_neo4j_driver, run_cypher
-from tools.search import search_functions_by_text
+from src.core import get_neo4j_driver, run_cypher
+from src.search import search_functions_by_text
 
 print("="*70)
 print("AB测试：基础检索 vs 模块扩展检索")

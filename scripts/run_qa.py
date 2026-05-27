@@ -31,7 +31,7 @@ from config import (
     LLM_MODEL, EMBEDDING_MODEL
 )
 from src.neo4j_writer import get_driver
-from tools.agent_qa import (
+from src.qa.agent import (
     _load_rag_index,
     _cosine_sim,
     _run as neo4j_run,

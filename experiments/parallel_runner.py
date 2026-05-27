@@ -23,10 +23,9 @@ from datetime import datetime
 _FILE = Path(__file__).resolve()
 _ROOT = _FILE.parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
-sys.path.insert(0, str(_ROOT / "tools"))
 sys.path.insert(0, str(_ROOT))
 
-SCRIPT_DIR = _ROOT / "tools"
+SCRIPT_DIR = _ROOT / "scripts"
 DATA_DIR = _ROOT / "data"
 RESULTS_DIR = _ROOT / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -220,7 +219,7 @@ def run_llm_judge(agent_results: list, rag_results: list, output_path: Path, mod
 def run_classic_rag(csv_path: Path, output_path: Path, limit: int = 0):
     """并行运行 Classic-RAG（直接调用模块内函数，不走子进程）"""
     import pandas as pd
-    from classic_rag import retrieve, generate_answer
+    from src.qa.classic_rag import retrieve, generate_answer
     from openai import OpenAI
 
     df = pd.read_csv(csv_path)
@@ -295,8 +294,8 @@ def run_classic_rag(csv_path: Path, output_path: Path, limit: int = 0):
 def run_graph_agent(csv_path: Path, output_path: Path, limit: int = 0):
     """并行运行 Graph-Agent"""
     import pandas as pd
-    from agent_qa import run_agent
-    from neo4j_writer import get_driver
+    from src.qa.agent import run_agent
+    from src.neo4j_writer import get_driver
 
     df = pd.read_csv(csv_path)
     if limit > 0:
@@ -411,7 +410,7 @@ def main():
     if not args.skip_agent:
         print("\n[3/4] 运行 Graph-Agent（等待 Neo4j 重建完成）...")
         # 检查 Neo4j 是否有数据
-        from neo4j_writer import get_driver
+        from src.neo4j_writer import get_driver
         driver = get_driver()
         with driver.session() as s:
             result = s.run("MATCH (f:Function) RETURN count(f) as cnt")

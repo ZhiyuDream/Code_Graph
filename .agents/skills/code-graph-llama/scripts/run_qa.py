@@ -30,7 +30,7 @@ from config import LLM_MODEL, OPENAI_API_KEY, OPENAI_BASE_URL
 from openai import OpenAI
 
 # 导入 Code_Graph 现有工具
-from tools.agent_qa import (
+from src.qa.agent import (
     _load_rag_index,
     _load_issue_index,
     _cosine_sim,

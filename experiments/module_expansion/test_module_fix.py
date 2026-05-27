@@ -4,14 +4,15 @@
 """
 
 import sys
-sys.path.insert(0, '/data/yulin/RUC/Code_Graph')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import json
 import networkx as nx
 from collections import defaultdict
-from tools.core import get_neo4j_driver, run_cypher, call_llm
-from tools.search import search_functions_by_text
-from tools.core.answer_generator import generate_answer
+from src.core import get_neo4j_driver, run_cypher, call_llm
+from src.search import search_functions_by_text
+from src.core.answer_generator import generate_answer
 
 print("="*70)
 print("模块扩展效果验证 - 修复错误问题")

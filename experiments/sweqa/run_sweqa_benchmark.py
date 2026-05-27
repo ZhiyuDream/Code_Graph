@@ -223,7 +223,7 @@ def run_evaluation(project: str) -> bool:
 
     os.environ["RAG_INDEX_NAME"] = f"{project}_rag_index.json"
 
-    from tools.agent_qa import run_agent
+    from src.qa.agent import run_agent
     driver = get_driver()
     results = []
 

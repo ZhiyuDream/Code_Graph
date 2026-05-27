@@ -26,7 +26,7 @@ from .base import BaseRetriever, RetrievalResult
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
-from tools.search.frequency_penalty import is_high_frequency, DEFAULT_THRESHOLD
+from src.search.frequency_penalty import is_high_frequency, DEFAULT_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
