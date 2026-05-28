@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Code_Graph builds a code graph from C++ repositories (primarily llama.cpp) using clangd LSP, stores it in Neo4j, and answers repository-level questions via a ReAct-based retrieval agent. The primary metric is accuracy (currently ~54% on llamacpp_benchmark_v2).
+Code_Graph builds a code graph from C++ repositories (primarily llama.cpp) using clangd LSP, stores it in Neo4j, and answers repository-level questions via a ReAct-based retrieval agent. The primary metric is accuracy (currently ~54% on llamacpp_benchmark_v2 with DeepSeek V4 Pro).
 
 ## Setup
 
