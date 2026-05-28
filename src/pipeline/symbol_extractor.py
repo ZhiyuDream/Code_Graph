@@ -284,6 +284,19 @@ def extract_calls_for_function(
     line0 = max(0, func.start_line - 1)
     char0 = func.start_character
 
+    # prepareCallHierarchy requires cursor on the function name, not the line start.
+    # If start_character points to the return type (e.g. 0 for "std::string func(...)"),
+    # find the actual function name position in the source line.
+    if char0 == 0 and func.name:
+        try:
+            full_path = str(repo_root / file_path) if repo_root else file_path
+            source_line = Path(full_path).read_text(encoding='utf-8', errors='ignore').split('\n')[line0]
+            name_pos = source_line.find(func.name)
+            if name_pos >= 0:
+                char0 = name_pos
+        except Exception:
+            pass
+
     items = lsp_request(
         "textDocument/prepareCallHierarchy",
         {"textDocument": {"uri": file_uri}, "position": {"line": line0, "character": char0}},
