@@ -66,16 +66,17 @@ def _collect_source_files(
                 continue
             source_files.add(fpath)
 
-    # 扫描头文件
-    header_exts = {".h", ".hpp", ".hh", ".hxx"}
+    # 扫描所有源文件（补充 compile_commands.json 中缺失的文件）
     skip_dirs = {'.git', 'build', 'bin', 'obj', '.cache', 'node_modules', 'venv', '.venv', '__pycache__'}
     if repo_root.exists():
         for root, dirs, files in os.walk(repo_root):
             dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
             for f in files:
-                if Path(f).suffix.lower() in header_exts:
+                if Path(f).suffix.lower() in source_exts:
                     full_path = os.path.normpath(os.path.join(root, f))
                     rel = os.path.relpath(full_path, repo_root)
+                    if rel.startswith("build") and os.sep in rel:
+                        continue
                     if not _should_include(rel):
                         continue
                     source_files.add(full_path)
