@@ -24,7 +24,7 @@ def build_context(collected: Dict) -> str:
 
     # 按来源分类
     embedding_funcs = [f for f in funcs if f.get('source') in ('', 'embedding', 'name_lookup', 'semantic_react')]
-    chain_funcs = [f for f in funcs if 'caller' in f.get('source', '') or 'callee' in f.get('source', '')]
+    chain_funcs = [f for f in funcs if 'caller' in f.get('source', '') or 'callee' in f.get('source', '') or 'grep_callers' in f.get('source', '')]
     grep_funcs = [f for f in funcs if 'grep' in f.get('source', '')]
     file_exp_funcs = [f for f in funcs if f.get('source') in ('file_expansion', 'class_expansion')]
     

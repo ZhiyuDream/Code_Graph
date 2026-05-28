@@ -350,6 +350,20 @@ def react_search(driver, client, question: str, prompt_template: str = None) -> 
             chain = expand_call_chain(target, direction)
             found = len(chain["functions"])
             new_count = _add_new_funcs(collected, chain["functions"], f'{direction}_of_{target}')
+
+            # 如果 Neo4j 没找到 caller，用 grep 补充搜索
+            if direction == "callers" and found == 0:
+                grep_results = grep_codebase(target, limit=5)
+                if grep_results:
+                    grep_funcs = convert_grep_to_function_results(grep_results)
+                    # 排除目标函数自身
+                    grep_funcs = [f for f in grep_funcs if f.get('name') != target]
+                    extra = _add_new_funcs(collected, grep_funcs, f'grep_callers_of_{target}')
+                    found += len(grep_funcs)
+                    new_count += extra
+                    if extra:
+                        print(f"      Grep补充caller: {extra} 个")
+
             collected["call_chains"].append({
                 "from": target, "direction": direction,
                 "found": found, "new": new_count
