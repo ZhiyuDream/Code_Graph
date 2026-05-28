@@ -14,7 +14,7 @@ from pathlib import Path
 入口不定死规则，后续可接入 agent（读文档、grep）再筛或增补。展开深度与节点上限见下方常量或环境变量。
 """
 
-_CODE_GRAPH = Path(__file__).resolve().parent
+_CODE_GRAPH = Path(__file__).resolve().parent.parent
 if str(_CODE_GRAPH) not in sys.path:
     sys.path.insert(0, str(_CODE_GRAPH))
 
