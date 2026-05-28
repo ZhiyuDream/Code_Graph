@@ -129,7 +129,21 @@ def initial_search(driver, client, question: str) -> dict:
     
     # Issue搜索
     issues = search_issues(question, top_k=3)
-    
+
+    # 去重：同名函数保留 text 最长的版本
+    deduped = {}
+    for f in funcs:
+        name = f.get('name', '')
+        if name not in deduped or len(f.get('text', '')) > len(deduped[name].get('text', '')):
+            deduped[name] = f
+    funcs = list(deduped.values())
+
+    # 补充所有函数的完整代码（不只是目标函数）
+    from src.search.code_reader import enrich_function_with_code
+    for f in funcs:
+        if len(f.get('text', '')) < 200:
+            enrich_function_with_code(f)
+
     # 记录初始步骤
     steps = [{
         "step": 1,
@@ -137,7 +151,7 @@ def initial_search(driver, client, question: str) -> dict:
         "found": len(funcs),
         "fallback_triggered": fallback_triggered
     }]
-    
+
     return {
         "functions": funcs,
         "issues": issues,
@@ -162,15 +176,15 @@ def react_decide(client, question: str, collected: dict, step: int, prompt_templ
     
     # 构建当前上下文（参考P0版本格式）
     context_lines = [f"问题: {question}"]
-    context_lines.append(f"\n【已收集函数】(共{len(funcs)}个，按相似度排序):")
-    
+
     # 已扩展的函数
     expanded = [c['from'] for c in chains]
-    for i, f in enumerate(funcs[:5]):
+    func_items = []
+    for i, f in enumerate(funcs[:8]):
         source = f.get('source', 'embedding') if f.get('source') else 'embedding'
         score = f.get('score', 0)
         marker = " [已扩展]" if f['name'] in expanded else ""
-        context_lines.append(f"{i+1}. {f['name']} ({source}, {score:.3f}){marker}")
+        func_items.append(f"{i+1}. {f['name']} ({source}, {score:.3f}){marker}")
     
     if issues:
         context_lines.append(f"\n【相关Issue】(共{len(issues)}个):")
@@ -240,7 +254,7 @@ def react_decide(client, question: str, collected: dict, step: int, prompt_templ
             question=question,
             context=context,
             function_count=len(funcs),
-            function_list="\n".join(context_lines[1:]),
+            function_list="\n".join(func_items),
             issue_count=len(issues),
             issue_list=issue_list,
             chain_count=len(chains),
@@ -297,12 +311,16 @@ def react_decide(client, question: str, collected: dict, step: int, prompt_templ
 
 
 def _add_new_funcs(collected, new_funcs, source_tag):
-    """去重并添加新函数到 collected，返回新增数量"""
+    """去重并添加新函数到 collected，返回新增数量。自动 enrich 缺少代码的函数。"""
+    from src.search.code_reader import enrich_function_with_code
     new_count = 0
     for fn in new_funcs:
         if not any(f['name'] == fn['name'] for f in collected["functions"]):
             fn['score'] = fn.get('score', 0.5)
             fn['source'] = source_tag
+            # 补充完整代码
+            if len(fn.get('text', '')) < 200:
+                enrich_function_with_code(fn)
             collected["functions"].append(fn)
             new_count += 1
     return new_count

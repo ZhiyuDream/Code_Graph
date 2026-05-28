@@ -11,9 +11,17 @@ def build_context(collected: Dict) -> str:
     funcs = collected.get("functions", [])
     issues = collected.get("issues", [])
     steps = collected.get("steps", [])
-    
+
+    # 去重：同名函数保留 text 最长的版本
+    seen = {}
+    for f in funcs:
+        name = f.get('name', '')
+        if name not in seen or len(f.get('text', '')) > len(seen[name].get('text', '')):
+            seen[name] = f
+    funcs = list(seen.values())
+
     lines = []
-    
+
     # 按来源分类
     embedding_funcs = [f for f in funcs if f.get('source') in ('', 'embedding', 'name_lookup', 'semantic_react')]
     chain_funcs = [f for f in funcs if 'caller' in f.get('source', '') or 'callee' in f.get('source', '')]
