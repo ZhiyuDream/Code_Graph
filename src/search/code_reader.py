@@ -64,19 +64,23 @@ def _extract_function_by_name(lines: list, func_name: str, max_lines: int = 50) 
     
     # C++ 函数定义模式
     # 匹配函数名后跟左括号，前面可能有返回类型、命名空间等
+    # 优先匹配定义而非调用（::funcName( 或 行首 funcName(）
     patterns = [
-        # 标准函数定义: void funcName(
-        rf'(?:^|\n)\s*(?:\w+\s+)*?\s*{re.escape(func_name)}\s*\(',
-        # 构造函数: Class::funcName(
-        rf'{re.escape(func_name)}\s*\(',
+        # 构造函数/方法定义: Class::funcName( 或 Namespace::funcName(
+        rf'::\s*{re.escape(func_name)}\s*\(',
+        # 标准函数定义: 行首可能有返回类型 void funcName(
+        rf'^\s*(?:[\w:<>]+\s+)*?{re.escape(func_name)}\s*\(',
         # 模板函数: template<...> void funcName(
         rf'template<[^>]+>\s*(?:\w+\s+)*?{re.escape(func_name)}\s*\(',
+        # 通用匹配（兜底）
+        rf'{re.escape(func_name)}\s*\(',
     ]
     
     # 找到函数定义的起始行
+    # 优先尝试更精确的模式（::funcName），再用通用模式兜底
     start_line_idx = -1
-    for i, line in enumerate(lines):
-        for pattern in patterns:
+    for pattern in patterns:
+        for i, line in enumerate(lines):
             if re.search(pattern, line):
                 start_line_idx = i
                 break
@@ -84,8 +88,8 @@ def _extract_function_by_name(lines: list, func_name: str, max_lines: int = 50) 
             break
     
     if start_line_idx < 0:
-        # 没找到函数定义，返回文件前 max_lines 行作为上下文
-        return ''.join(lines[:min(max_lines, len(lines))]).strip()
+        # 没找到函数定义，返回空字符串
+        return ''
     
     # 向前回溯，找到函数签名开始的位置（处理多行签名）
     signature_start = start_line_idx
@@ -163,8 +167,9 @@ def enrich_function_with_code(func: Dict) -> Dict:
         max_lines=200
     )
 
-    # 如果从 .h 文件只拿到声明（很短），尝试找对应的 .cpp 实现
+    # 如果从 .h 文件只拿到声明（很短），尝试在同目录 .cpp 文件中找实现
     if code and file_path.endswith('.h') and len(code) < 150:
+        # 先试同名 .cpp
         cpp_path = file_path.rsplit('.h', 1)[0] + '.cpp'
         cpp_code = read_function_from_file(
             file_path=cpp_path,
@@ -173,6 +178,21 @@ def enrich_function_with_code(func: Dict) -> Dict:
         )
         if cpp_code and not cpp_code.startswith('//') and len(cpp_code) > len(code):
             code = cpp_code
+
+        # 如果同名 .cpp 没找到，搜索同目录所有 .cpp 文件
+        if len(code) < 150:
+            full_h = REPO_ROOT / file_path if not file_path.startswith('/') else Path(file_path)
+            if full_h.parent.exists():
+                for cpp_file in sorted(full_h.parent.glob('*.cpp')):
+                    rel = str(cpp_file.relative_to(REPO_ROOT))
+                    cpp_code = read_function_from_file(
+                        file_path=rel,
+                        func_name=func_name,
+                        max_lines=200
+                    )
+                    if cpp_code and not cpp_code.startswith('//') and len(cpp_code) > len(code):
+                        code = cpp_code
+                        break
 
     if code and not code.startswith('//'):
         func['text'] = code

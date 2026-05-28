@@ -43,26 +43,39 @@ def _extract_target_function(question: str) -> str:
 
 
 def _lookup_by_name(func_name: str) -> list:
-    """从 RAG index 按函数名直接查找"""
+    """从 RAG index 按函数名直接查找，去重并优先保留代码更长的版本"""
     from src.search.semantic_search import _load_rag_index
+    from src.search.code_reader import enrich_function_with_code
     idx = _load_rag_index()
     if not idx:
         return []
-    results = []
+    # 收集所有匹配的 chunk
+    candidates = []
     for c in idx['chunks']:
         if c['type'] == 'function' and c.get('meta', {}).get('name') == func_name:
-            from src.search.code_reader import enrich_function_with_code
-            func = {
-                'name': func_name,
-                'file': c['meta'].get('file', ''),
-                'text': c.get('text', ''),
-                'score': 1.0,
-                'source': 'name_lookup',
-                'start_line': c['meta'].get('start_line', 0),
-                'end_line': c['meta'].get('end_line', 0),
-            }
-            func = enrich_function_with_code(func)
-            results.append(func)
+            candidates.append(c)
+    if not candidates:
+        return []
+    # 去重：按文件分组，每个文件保留 text 最长的
+    by_file = {}
+    for c in candidates:
+        f = c['meta'].get('file', '')
+        if f not in by_file or len(c.get('text', '')) > len(by_file[f].get('text', '')):
+            by_file[f] = c
+    # 优先 .cpp 文件
+    results = []
+    for f, c in sorted(by_file.items(), key=lambda x: (not x[0].endswith('.cpp'), -len(x[1].get('text', '')))):
+        func = {
+            'name': func_name,
+            'file': c['meta'].get('file', ''),
+            'text': c.get('text', ''),
+            'score': 1.0,
+            'source': 'name_lookup',
+            'start_line': c['meta'].get('start_line', 0),
+            'end_line': c['meta'].get('end_line', 0),
+        }
+        func = enrich_function_with_code(func)
+        results.append(func)
     return results
 
 
