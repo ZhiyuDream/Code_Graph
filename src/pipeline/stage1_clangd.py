@@ -17,7 +17,7 @@ from .index_waiter import wait_for_index
 from .lsp_client import LSPClient
 from .models import FileResult, FunctionSymbol, RawCall, ResolvedCalls
 from .neo4j_batch_writer import clear_code_graph, ensure_constraints, write_graph
-from .symbol_extractor import process_file
+from .symbol_extractor import process_file, extract_incoming_calls_for_function
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,7 @@ def run_full_pipeline(
         统计信息 dict
     """
     t0_total = time.perf_counter()
+    incoming_raw_calls: list[RawCall] = []
 
     # 1. 启动 clangd
     logger.info("Starting clangd...")
@@ -175,6 +176,53 @@ def run_full_pipeline(
         extract_elapsed = time.perf_counter() - t0
         logger.info("Symbol extraction done in %.1fs", extract_elapsed)
 
+        # 3b. incomingCalls 补充（捕获 lambda 内的调用关系）
+        if collect_calls:
+            logger.info("Extracting incoming calls (lambda-aware)...")
+            t_incoming = time.perf_counter()
+            incoming_raw_calls: list[RawCall] = []
+
+            # 建立全局函数索引（用于去重已有的 outgoing 调用）
+            existing_edges: set[tuple[str, int, str]] = set()  # (caller_file, caller_line, callee_name)
+            for fr in file_results:
+                for rc in fr.calls:
+                    existing_edges.add((rc.file_path, rc.line, rc.callee_name))
+
+            # 为每个文件的每个函数调用 incomingCalls
+            for i, fr in enumerate(file_results):
+                abs_path = str(repo_root / fr.file_path)
+                file_uri = Path(abs_path).resolve().as_uri()
+                # 确保文件已 didOpen
+                try:
+                    content = Path(abs_path).read_text(encoding='utf-8', errors='replace')
+                    client.notify("textDocument/didOpen", {
+                        "textDocument": {"uri": file_uri, "languageId": "cpp", "version": 1, "text": content}
+                    })
+                except Exception:
+                    pass
+
+                for func in fr.functions:
+                    try:
+                        inc_calls = extract_incoming_calls_for_function(
+                            client.request, file_uri, func,
+                            repo_root=repo_root, sleep_after=0.01,
+                        )
+                        for rc in inc_calls:
+                            # 去重：如果 outgoingCalls 已经捕获了这条边，跳过
+                            edge_key = (rc.file_path, rc.line, rc.callee_name)
+                            if edge_key not in existing_edges:
+                                incoming_raw_calls.append(rc)
+                                existing_edges.add(edge_key)
+                    except Exception:
+                        pass
+
+                if (i + 1) % 50 == 0:
+                    logger.info("  Incoming calls: %d/%d files...", i + 1, len(file_results))
+
+            incoming_elapsed = time.perf_counter() - t_incoming
+            logger.info("Incoming calls done in %.1fs, added %d new edges",
+                        incoming_elapsed, len(incoming_raw_calls))
+
     # 4. 解析字段
     logger.info("Resolving fields...")
     file_results = enrich_file_results(file_results)
@@ -201,6 +249,9 @@ def run_full_pipeline(
             ))
         all_var_refs.extend(fr.raw.get("var_refs_global", []))
         offset += len(fr.functions)
+
+    # 合并 incomingCalls 补充的调用关系
+    all_raw_calls.extend(incoming_raw_calls)
 
     resolved = resolve_all_calls(all_functions, all_raw_calls)
 

@@ -64,6 +64,27 @@ def _get_caller_dir(file_path: str) -> str:
     return os.path.dirname(file_path)
 
 
+def _find_caller_by_location(
+    lookup: FunctionLookup,
+    file_path: str,
+    line: int,
+) -> FunctionSymbol | None:
+    """通过文件路径和行号查找包含该行的函数。"""
+    # 先用 (file_path, line) 做精确匹配
+    for (fp, name, start_line), func_id in lookup.by_location.items():
+        if fp == file_path and start_line == line:
+            return lookup.by_id[func_id]
+
+    # 再找包含该行的函数
+    for (fp, name), candidates in lookup.by_name.items():
+        if fp == file_path:
+            for func_id, start_line, end_line in candidates:
+                if start_line <= line <= end_line:
+                    return lookup.by_id[func_id]
+
+    return None
+
+
 def resolve_call(
     lookup: FunctionLookup,
     raw: RawCall,
@@ -160,13 +181,20 @@ def resolve_all_calls(
     global_match_count = 0
 
     for raw in raw_calls:
-        if raw.caller_index < 0 or raw.caller_index >= len(functions):
+        if raw.caller_index < 0:
+            # incomingCalls 模式：通过 (file_path, line) 查找 caller
+            caller = _find_caller_by_location(lookup, raw.file_path, raw.line)
+            if caller is None:
+                logger.debug("Cannot resolve caller at %s:%d", raw.file_path, raw.line)
+                continue
+            caller_id = caller.id
+        elif raw.caller_index >= len(functions):
             logger.warning("Invalid caller_index: %d (total functions: %d)",
                            raw.caller_index, len(functions))
             continue
-
-        caller = functions[raw.caller_index]
-        caller_id = caller.id
+        else:
+            caller = functions[raw.caller_index]
+            caller_id = caller.id
 
         if not caller_id:
             logger.warning("Function at index %d has no id", raw.caller_index)

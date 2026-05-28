@@ -344,6 +344,82 @@ def extract_calls_for_function(
     return calls
 
 
+def extract_incoming_calls_for_function(
+    lsp_request: callable,
+    file_uri: str,
+    func: FunctionSymbol,
+    repo_root: Path | None = None,
+    sleep_after: float = 0.02,
+) -> list[RawCall]:
+    """
+    对单个函数请求 callHierarchy/incomingCalls（反向查找 caller）。
+    能捕获 lambda 内部的调用关系（outgoingCalls 不能）。
+
+    Returns:
+        RawCall 列表（caller_index=-1，需后续 resolve 阶段处理）
+    """
+    line0 = max(0, func.start_line - 1)
+    char0 = func.start_character
+
+    # 定位到函数名
+    if char0 == 0 and func.name:
+        try:
+            full_path = str(repo_root / func.file_path) if repo_root else func.file_path
+            source_line = Path(full_path).read_text(encoding='utf-8', errors='ignore').split('\n')[line0]
+            name_pos = source_line.find(func.name)
+            if name_pos >= 0:
+                char0 = name_pos
+        except Exception:
+            pass
+
+    items = lsp_request(
+        "textDocument/prepareCallHierarchy",
+        {"textDocument": {"uri": file_uri}, "position": {"line": line0, "character": char0}},
+    )
+    if items is None:
+        items = []
+    elif not isinstance(items, list):
+        items = [items]
+
+    calls: list[RawCall] = []
+    import os
+
+    for item in items:
+        incoming = lsp_request(
+            "callHierarchy/incomingCalls",
+            {"item": item},
+        )
+        if incoming is None:
+            incoming = []
+        elif not isinstance(incoming, list):
+            incoming = [incoming]
+
+        for inc in incoming:
+            from_item = inc.get("from") or {}
+            caller_name = from_item.get("name", "")
+            if not caller_name:
+                continue
+            caller_uri = from_item.get("uri", "")
+            caller_path = _uri_to_path(caller_uri) if caller_uri else ""
+            if repo_root and caller_path and caller_path.startswith(str(repo_root)):
+                caller_path = os.path.relpath(caller_path, repo_root)
+            r = from_item.get("range", {})
+            caller_line = r.get("start", {}).get("line", 0) + 1
+            calls.append(RawCall(
+                caller_index=-1,  # 需要后续 resolve 阶段按 (file_path, name, line) 查找
+                callee_name=func.name,
+                file_path=caller_path or func.file_path,
+                line=caller_line,
+                callee_file_path=func.file_path,
+                callee_line=func.start_line,
+            ))
+
+    if sleep_after > 0:
+        time.sleep(sleep_after)
+
+    return calls
+
+
 def extract_references_for_variable(
     lsp_request: callable,
     file_uri: str,
