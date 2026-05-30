@@ -14,7 +14,7 @@ from .call_resolver import resolve_all_calls
 from .field_resolver import enrich_file_results
 from .graph_assembler import assemble_graph
 from .index_waiter import wait_for_index
-from .lsp_client import LSPClient
+from .lsp_client import LSPClient, LSPTimeoutError
 from .models import FileResult, FunctionSymbol, RawCall, ResolvedCalls
 from .neo4j_batch_writer import clear_code_graph, ensure_constraints, write_graph
 from .symbol_extractor import process_file, extract_incoming_calls_for_function
@@ -28,8 +28,14 @@ def _collect_source_files(
     include_dirs: list[str] | None = None,
 ) -> list[str]:
     """
-    收集所有源文件（含头文件）。
-    复用 clangd_parser 的逻辑。
+    收集源文件。
+
+    策略：
+    1. 从 compile_commands.json 收集（clangd 有编译命令的文件）
+    2. os.walk 补充缺失的文件（包括头文件）
+    3. 按文件类型排序：先 .cpp/.c/.cc/.cxx（实现文件），后 .h/.hpp（头文件）
+       这样 clangd 的 background-index 会先索引实现文件及其包含的头文件，
+       后续处理头文件时 documentSymbol 请求不会超时卡住。
 
     Args:
         include_dirs: 若指定，只收集这些目录下的文件（相对于 repo_root 的顶层目录名）
@@ -38,6 +44,7 @@ def _collect_source_files(
     import os
 
     source_exts = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx"}
+    impl_exts = {".c", ".cpp", ".cc", ".cxx"}  # 实现文件，可以补充
 
     def _should_include(rel_path: str) -> bool:
         if include_dirs is None:
@@ -45,7 +52,7 @@ def _collect_source_files(
         top = rel_path.split(os.sep)[0]
         return top in include_dirs
 
-    # 从 compile_commands.json 收集
+    # 从 compile_commands.json 收集（所有文件类型）
     cc_path = compile_commands_dir / "compile_commands.json"
     source_files: set[str] = set()
     if cc_path.exists():
@@ -67,6 +74,8 @@ def _collect_source_files(
             source_files.add(fpath)
 
     # 扫描所有源文件（补充 compile_commands.json 中缺失的文件）
+    # 头文件也补充，但按类型排序：先 .cpp/.c 让 clangd background-index 索引头文件，
+    # 再处理头文件时就不会超时卡住
     skip_dirs = {'.git', 'build', 'bin', 'obj', '.cache', 'node_modules', 'venv', '.venv', '__pycache__'}
     if repo_root.exists():
         for root, dirs, files in os.walk(repo_root):
@@ -81,9 +90,20 @@ def _collect_source_files(
                         continue
                     source_files.add(full_path)
 
+    # 按文件类型排序：先实现文件(.cpp/.c/.cc/.cxx)，后头文件(.h/.hpp)
+    # 这样 clangd 的 background-index 会先索引实现文件及其包含的头文件，
+    # 后续处理头文件时 documentSymbol 请求不会超时
+    def _sort_key(path: str) -> tuple:
+        ext = Path(path).suffix.lower()
+        # 实现文件排前面 (0)，头文件排后面 (1)
+        is_header = 1 if ext in {'.h', '.hpp', '.hh', '.hxx'} else 0
+        return (is_header, path)
+
+    sorted_paths = sorted(source_files, key=_sort_key)
+
     # 转换为相对路径
     result = []
-    for abs_path in sorted(source_files):
+    for abs_path in sorted_paths:
         if abs_path.startswith(str(repo_root)):
             result.append(os.path.relpath(abs_path, repo_root))
         else:
@@ -166,9 +186,13 @@ def run_full_pipeline(
                     skip_vendor_calls=skip_vendor_calls,
                 )
                 file_results.append(result)
+            except LSPTimeoutError as e:
+                # clangd 处理某些文件时可能超时（如复杂模板），跳过该文件
+                logger.warning("Timeout processing %s: %s", file_path, e)
+                # 不 re-raise，继续下一个文件
             except Exception as e:
                 logger.warning("Failed to process %s: %s", file_path, e)
-                raise  # 向上传播，不再静默吞掉
+                raise  # 其他异常向上传播
 
             if (i + 1) % 50 == 0:
                 logger.info("  Processed %d/%d files...", i + 1, len(files))
@@ -177,8 +201,26 @@ def run_full_pipeline(
         logger.info("Symbol extraction done in %.1fs", extract_elapsed)
 
         # 3b. incomingCalls 补充（捕获 lambda 内的调用关系）
+        # 优化：只对有 outgoingCalls 的函数执行 incomingCalls
         if collect_calls:
-            logger.info("Extracting incoming calls (lambda-aware)...")
+            # 统计每个函数有多少 outgoingCalls
+            func_outgoing_count: dict[str, int] = {}
+            for fr in file_results:
+                for rc in fr.calls:
+                    caller_id = f"{rc.file_path}:{rc.line}"
+                    func_outgoing_count[caller_id] = func_outgoing_count.get(caller_id, 0) + 1
+
+            # 筛选出 outgoingCalls 为 0 的函数（通常是 lambda/回调）
+            funcs_with_zero_outgoing = []
+            for fr in file_results:
+                for func in fr.functions:
+                    func_id = f"{func.file_path}:{func.start_line}"
+                    if func_outgoing_count.get(func_id, 0) == 0:
+                        funcs_with_zero_outgoing.append((fr, func))
+
+            logger.info("Extracting incoming calls (lambda-aware, selective: %d/%d funcs)...",
+                        len(funcs_with_zero_outgoing),
+                        sum(len(fr.functions) for fr in file_results))
             t_incoming = time.perf_counter()
             incoming_raw_calls: list[RawCall] = []
 
@@ -188,9 +230,13 @@ def run_full_pipeline(
                 for rc in fr.calls:
                     existing_edges.add((rc.file_path, rc.line, rc.callee_name))
 
-            # 为每个文件的每个函数调用 incomingCalls
-            for i, fr in enumerate(file_results):
-                abs_path = str(repo_root / fr.file_path)
+            # 按文件分组，减少 didOpen/didClose 次数
+            funcs_by_file: dict[str, list[tuple[Any, FunctionSymbol]]] = {}
+            for fr, func in funcs_with_zero_outgoing:
+                funcs_by_file.setdefault(fr.file_path, []).append((fr, func))
+
+            for i, (file_path, func_list) in enumerate(funcs_by_file.items()):
+                abs_path = str(repo_root / file_path)
                 file_uri = Path(abs_path).resolve().as_uri()
                 # 确保文件已 didOpen
                 try:
@@ -201,11 +247,11 @@ def run_full_pipeline(
                 except Exception:
                     pass
 
-                for func in fr.functions:
+                for fr, func in func_list:
                     try:
                         inc_calls = extract_incoming_calls_for_function(
                             client.request, file_uri, func,
-                            repo_root=repo_root, sleep_after=0.01,
+                            repo_root=repo_root, sleep_after=0.01, timeout=30.0,
                         )
                         for rc in inc_calls:
                             # 去重：如果 outgoingCalls 已经捕获了这条边，跳过
@@ -213,11 +259,13 @@ def run_full_pipeline(
                             if edge_key not in existing_edges:
                                 incoming_raw_calls.append(rc)
                                 existing_edges.add(edge_key)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # 记录超时的函数，后续分析用
+                        logger.warning("Incoming calls timeout for %s:%s:%d: %s",
+                                       func.file_path, func.name, func.start_line, e)
 
                 if (i + 1) % 50 == 0:
-                    logger.info("  Incoming calls: %d/%d files...", i + 1, len(file_results))
+                    logger.info("  Incoming calls: %d/%d files...", i + 1, len(funcs_by_file))
 
             incoming_elapsed = time.perf_counter() - t_incoming
             logger.info("Incoming calls done in %.1fs, added %d new edges",
@@ -284,14 +332,18 @@ def run_full_pipeline(
         "calls": len(e.get("CALLS", [])),
         "ambiguous": len(e.get("CALLS_AMBIGUOUS", [])),
         "unresolved": len(resolved.unresolved),
+        "external_calls": len(e.get("EXTERNAL_CALLS", [])),
+        "control_flow": len(n.get("ControlFlowBlock", [])),
         "elapsed_total": total_elapsed,
         "elapsed_extract": extract_elapsed,
     }
     logger.info(
         "Pipeline complete in %.1fs: %d files, %d functions, %d classes, "
-        "%d variables, %d attributes, %d calls, %d ambiguous, %d unresolved",
+        "%d variables, %d attributes, %d calls, %d ambiguous, %d unresolved, "
+        "%d external, %d control_flow",
         total_elapsed, stats["files"], stats["functions"], stats["classes"],
         stats["variables"], stats["attributes"], stats["calls"],
         stats["ambiguous"], stats["unresolved"],
+        stats["external_calls"], stats["control_flow"],
     )
     return stats

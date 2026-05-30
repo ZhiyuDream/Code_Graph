@@ -174,11 +174,16 @@ def resolve_all_calls(
         raw_calls: 原始调用记录列表
 
     Returns:
-        ResolvedCalls
+        ResolvedCalls（含 external_calls）
     """
     lookup = build_function_lookup(functions)
     resolved = ResolvedCalls()
     global_match_count = 0
+
+    # 收集仓库内所有函数名（用于判断是否为外部调用）
+    all_known_names: set[str] = set()
+    for f in functions:
+        all_known_names.add(f.name)
 
     for raw in raw_calls:
         if raw.caller_index < 0:
@@ -214,11 +219,15 @@ def resolve_all_calls(
         elif status == "ambiguous" and candidates:
             resolved.ambiguous.append((caller_id, raw.callee_name, candidates))
         else:
-            resolved.unresolved.append((caller_id, raw.callee_name))
+            # unresolved：区分外部调用 vs 真正找不到的
+            if raw.callee_name and raw.callee_name not in all_known_names:
+                resolved.external_calls.append((caller_id, raw.callee_name))
+            else:
+                resolved.unresolved.append((caller_id, raw.callee_name))
 
     logger.info(
-        "Call resolution: %d resolved, %d global_match, %d ambiguous, %d unresolved",
+        "Call resolution: %d resolved, %d global_match, %d ambiguous, %d unresolved, %d external",
         len(resolved.calls) - global_match_count, global_match_count,
-        len(resolved.ambiguous), len(resolved.unresolved)
+        len(resolved.ambiguous), len(resolved.unresolved), len(resolved.external_calls),
     )
     return resolved

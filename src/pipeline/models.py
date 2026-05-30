@@ -73,3 +73,5 @@ class ResolvedCalls:
     ambiguous: list[tuple[str, str, list[str]]] = field(default_factory=list)
     # (caller_id, callee_name)
     unresolved: list[tuple[str, str]] = field(default_factory=list)
+    # (caller_id, callee_name) — 外部库/系统调用
+    external_calls: list[tuple[str, str]] = field(default_factory=list)

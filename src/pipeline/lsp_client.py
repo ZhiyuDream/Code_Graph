@@ -117,7 +117,15 @@ class LSPClient:
         self.proc.stdin.write(raw)
         self.proc.stdin.flush()
 
-    def _read_message(self) -> str | None:
+    def _read_message(self, read_timeout: float = 1.0) -> str | None:
+        """读取一条 LSP 消息，支持超时避免 readline 永久阻塞。"""
+        import select
+
+        # 等待 stdout 有数据，超时返回 None
+        ready, _, _ = select.select([self.proc.stdout], [], [], read_timeout)
+        if not ready:
+            return None
+
         first = self.proc.stdout.readline()
         if not first:
             return None

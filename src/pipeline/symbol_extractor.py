@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .fallback_symbol_extractor import process_file_fallback
+from .lsp_client import LSPTimeoutError
 from .models import ClassSymbol, FileResult, FunctionSymbol, RawCall, VariableSymbol
 
 logger = logging.getLogger(__name__)
@@ -350,10 +352,19 @@ def extract_incoming_calls_for_function(
     func: FunctionSymbol,
     repo_root: Path | None = None,
     sleep_after: float = 0.02,
+    timeout: float = 15.0,
 ) -> list[RawCall]:
     """
     对单个函数请求 callHierarchy/incomingCalls（反向查找 caller）。
     能捕获 lambda 内部的调用关系（outgoingCalls 不能）。
+
+    Args:
+        lsp_request: 发送 LSP request 的函数
+        file_uri: 文件的 LSP URI
+        func: 函数符号
+        repo_root: 仓库根目录
+        sleep_after: 每次请求后休眠时间
+        timeout: 单个 LSP 请求的超时（秒），默认 15 秒
 
     Returns:
         RawCall 列表（caller_index=-1，需后续 resolve 阶段处理）
@@ -372,10 +383,16 @@ def extract_incoming_calls_for_function(
         except Exception:
             pass
 
-    items = lsp_request(
-        "textDocument/prepareCallHierarchy",
-        {"textDocument": {"uri": file_uri}, "position": {"line": line0, "character": char0}},
-    )
+    try:
+        items = lsp_request(
+            "textDocument/prepareCallHierarchy",
+            {"textDocument": {"uri": file_uri}, "position": {"line": line0, "character": char0}},
+            timeout=timeout,
+        )
+    except Exception:
+        # prepareCallHierarchy 超时或失败，跳过该函数
+        return []
+
     if items is None:
         items = []
     elif not isinstance(items, list):
@@ -385,10 +402,16 @@ def extract_incoming_calls_for_function(
     import os
 
     for item in items:
-        incoming = lsp_request(
-            "callHierarchy/incomingCalls",
-            {"item": item},
-        )
+        try:
+            incoming = lsp_request(
+                "callHierarchy/incomingCalls",
+                {"item": item},
+                timeout=timeout,
+            )
+        except Exception:
+            # incomingCalls 超时或失败，跳过该 item
+            continue
+
         if incoming is None:
             incoming = []
         elif not isinstance(incoming, list):
@@ -639,10 +662,11 @@ def process_file(
         )
 
     try:
-        # 1. documentSymbol
+        # 1. documentSymbol（30秒超时，卡住时 fallback 到正则）
         symbols = lsp_request(
             "textDocument/documentSymbol",
             {"textDocument": {"uri": file_uri}},
+            timeout=30.0,
         )
         if symbols is None:
             symbols = []
@@ -686,6 +710,25 @@ def process_file(
                     sleep_after=delay_between_calls,
                 )
                 var_refs_global.extend(refs)
+
+    except LSPTimeoutError:
+        # clangd 解析超时（文件过大或过于复杂），退回到正则提取
+        # 不跳过文件，只是精度降低
+        logger.warning("LSP timeout for %s, falling back to regex extraction", file_path)
+        if not content:
+            content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+        fallback = process_file_fallback(
+            content=content,
+            file_path=file_path,
+            repo_root=repo_root,
+            extract_macros=extract_macros,
+        )
+        functions = fallback.functions
+        classes = fallback.classes
+        variables = fallback.variables
+        calls = fallback.calls
+        var_refs_global = []
+
     finally:
         if lsp_notify:
             lsp_notify(

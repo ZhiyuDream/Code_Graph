@@ -147,8 +147,10 @@ class TestResolveAllCalls:
         assert ("a.cpp:main:1", "a.cpp:bar:50") in result.calls
         assert ("a.cpp:foo:10", "a.cpp:foo:30") in result.calls
 
-        assert len(result.unresolved) == 1
-        assert result.unresolved[0] == ("a.cpp:main:1", "baz")
+        # baz 不在已知函数名中 → 标记为外部调用
+        assert len(result.external_calls) == 1
+        assert result.external_calls[0] == ("a.cpp:main:1", "baz")
+        assert len(result.unresolved) == 0
 
     def test_self_call_filtered(self):
         """真正的自调用（caller_id == callee_id）应被过滤。"""

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import ClassSymbol, FileResult, FunctionSymbol, ResolvedCalls, VariableSymbol
+from .control_flow_extractor import ControlFlowBlock, extract_all_control_flow
 
 try:
     import community as community_louvain
@@ -265,6 +266,7 @@ def assemble_graph(
         "Class": classes,
         "Variable": variables_list,
         "Attribute": [],
+        "ControlFlowBlock": [],
     }
 
     edges: dict[str, list[tuple[str, str, dict[str, Any]]]] = {
@@ -274,6 +276,8 @@ def assemble_graph(
         "REFERENCES_VAR": [],
         "HAS_MEMBER": [],
         "HAS_METHOD": [],
+        "EXTERNAL_CALLS": [],
+        "CONTROL_FLOW": [],
     }
 
     repo_id = "repo:1"
@@ -390,23 +394,50 @@ def assemble_graph(
                 "candidates": remapped_candidates,
             }))
 
+    # ---- EXTERNAL_CALLS 边（外部库/系统调用）----
+    seen_external = set()
+    for caller_id, callee_name in resolved_calls.external_calls:
+        new_caller = remap_id(caller_id)
+        ext_key = (new_caller, callee_name)
+        if ext_key not in seen_external:
+            edges["EXTERNAL_CALLS"].append((new_caller, f"external:{callee_name}", {
+                "callee_name": callee_name,
+            }))
+            seen_external.add(ext_key)
+
     # ---- P2: Louvain 社区发现 + Module 节点 ----
     if _LOUVAIN_AVAILABLE:
         _build_module_nodes(nodes, edges, functions, seen_calls)
 
-    logger.info(
-        "Graph assembled: %d functions, %d classes, %d variables, %d attributes, "
-        "%d calls, %d ambiguous, %d unresolved, %d modules",
-        len(functions), len(classes), len(variables_list), len(nodes["Attribute"]),
-        len(resolved_calls.calls), len(resolved_calls.ambiguous), len(resolved_calls.unresolved),
-        len(nodes.get("Module", []))
-    )
+    # ---- P3: 控制流提取（state_control, error_path 等证据）----
+    cf_blocks = extract_all_control_flow(file_results, repo_root=repo_root)
+    for block in cf_blocks:
+        cf_id = block.id
+        # 去重：同一函数同一行同一类型只保留一个
+        cf_node = {
+            "id": cf_id,
+            "type": block.type,
+            "condition": block.condition,
+            "file_path": block.file_path,
+            "line": block.line,
+            "is_error_path": block.is_error_path,
+        }
+        # 检查是否已存在（同一位置可能多个函数重叠）
+        existing_ids = {n["id"] for n in nodes["ControlFlowBlock"]}
+        if cf_id not in existing_ids:
+            nodes["ControlFlowBlock"].append(cf_node)
+            edges["CONTROL_FLOW"].append((block.function_id, cf_id, {
+                "type": block.type,
+                "line": block.line,
+            }))
 
     logger.info(
         "Graph assembled: %d functions, %d classes, %d variables, %d attributes, "
-        "%d calls, %d ambiguous, %d unresolved",
+        "%d calls, %d ambiguous, %d unresolved, %d external, %d control_flow, %d modules",
         len(functions), len(classes), len(variables_list), len(nodes["Attribute"]),
-        len(resolved_calls.calls), len(resolved_calls.ambiguous), len(resolved_calls.unresolved)
+        len(resolved_calls.calls), len(resolved_calls.ambiguous), len(resolved_calls.unresolved),
+        len(resolved_calls.external_calls), len(nodes["ControlFlowBlock"]),
+        len(nodes.get("Module", [])),
     )
 
     return {"nodes": nodes, "edges": edges}
