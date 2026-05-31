@@ -26,12 +26,12 @@
 
 ## 目录与脚本（规划）
 
-- **阶段 1（已实现）**：  
-  - `run_stage1.py`：基于 **clangd LSP**（documentSymbol + call hierarchy），与 IDE 行为一致，跨文件 CALLS 解析准确；需本机安装 **clangd 20+**，首次运行可能较慢（llama.cpp 规模约数分钟）。  
-  - ~~`run_stage1_clangd.py`~~：（已合并到 `run_stage1.py`，不再单独维护）。  
+- **代码摄取（已实现）**：  
+  - `scripts/ingestion/ingest_code.py`：基于 **clangd LSP**（documentSymbol + call hierarchy），与 IDE 行为一致，跨文件 CALLS 解析准确；需本机安装 **clangd 20+**，首次运行可能较慢（llama.cpp 规模约数分钟）。  
   采用方案 B（显式层级：Repository→Directory→File→Function/Class）。
-- **阶段 2（已实现）**：`run_stage2.py` 从 Neo4j 发现入口候选（图结构：无 CALLS 入边的 Function），沿 CALLS 展开得到调用子图，创建 Workflow 节点及 WORKFLOW_ENTRY、PART_OF_WORKFLOW 写入 Neo4j。入口不定死规则，后续可接入 agent。详见下方「使用说明（阶段 2）」与 `docs/STAGE2_实现与目录约定.md`。
-- **阶段 3（已实现）**：`run_stage3.py` 使用 `.env` 中的 **GITHUB_TOKEN** 调用 GitHub API，拉取仓库 Issue 与 Pull Request，写入 Neo4j（Issue、PullRequest 节点；PR 含 changed_paths；FIXES 边 PR→Issue）。查询「该 PR 涉及哪些函数」时用 Function.file_path 与 PR.changed_paths 匹配。详见下方「使用说明（阶段 3）」。
+  - `scripts/ingestion/ingest_code_incremental.py`：基于 git diff 的增量更新。
+- **Workflow 发现**：从 Neo4j 发现入口候选（图结构：无 CALLS 入边的 Function），沿 CALLS 展开得到调用子图，创建 Workflow 节点及 WORKFLOW_ENTRY、PART_OF_WORKFLOW 写入 Neo4j。详见 `docs/STAGE2_实现与目录约定.md`。
+- **GitHub 数据摄取（已实现）**：`scripts/github/ingest_github.py` 使用 `.env` 中的 **GITHUB_TOKEN** 调用 GitHub API，拉取仓库 Issue 与 Pull Request，写入 Neo4j（Issue、PullRequest 节点；PR 含 changed_paths；FIXES 边 PR→Issue）。查询「该 PR 涉及哪些函数」时用 Function.file_path 与 PR.changed_paths 匹配。
 - **环境变量**（.env）：`NEO4J_*`；`REPO_ROOT`（仓库根目录）；可选 `COMPILE_COMMANDS_DIR`；阶段 3 需 `GITHUB_TOKEN`，可选 `GITHUB_REPO=owner/repo`（未设置时从 REPO_ROOT 的 git remote 推导）。
 
 ## 与整体 pipeline 的关系
@@ -47,7 +47,7 @@
 
 ---
 
-## 使用说明（阶段 1）
+## 使用说明（代码摄取）
 
 1. **准备 compile_commands.json**  
    在待解析仓库（如 llama.cpp）根目录执行：`mkdir -p build && cd build && cmake ..`，得到 `build/compile_commands.json`。
@@ -66,9 +66,9 @@
    ```
    若系统缺少 libclang 动态库，可安装：`conda install -c conda-forge libclang` 或系统包（如 `libclang-14-dev`），并按需设置 `LIBCLANG_PATH`。
 
-4. **运行阶段 1**（需要 clangd 20+）
+4. **运行代码摄取**（需要 clangd 20+）
    ```bash
-   python run_stage1.py
+   python scripts/ingestion/ingest_code.py
    ```
    首次运行会启动 clangd 守护进程并索引代码，可能需要数分钟（llama.cpp 规模）。
    脚本会清空 Neo4j 中现有代码图、写入新图并更新 `Repository.last_processed_commit`。
@@ -80,13 +80,13 @@
 
 ---
 
-## 使用说明（阶段 2）
+## 使用说明（Workflow 发现）
 
-1. **前置**：先完成阶段 1（`run_stage1.py` 或 `run_stage1_clangd.py`），Neo4j 中已有 Function、CALLS 等。
+1. **前置**：先完成代码摄取（`scripts/ingestion/ingest_code.py`），Neo4j 中已有 Function、CALLS 等。
 
-2. **运行阶段 2**：
+2. **运行 Workflow 发现**：
    ```bash
-   python run_stage2.py
+   # Workflow 发现脚本（若存在）
    ```
    脚本会：从图中发现入口候选（无 CALLS 入边的 Function）→ 沿 CALLS BFS 展开 → 清空已有 Workflow 后写入新 Workflow 节点及 WORKFLOW_ENTRY、PART_OF_WORKFLOW。
 
@@ -98,13 +98,13 @@
 
 ---
 
-## 使用说明（阶段 3）
+## 使用说明（GitHub 数据摄取）
 
 1. **配置**：在 `.env` 中设置 **GITHUB_TOKEN**（GitHub 个人访问令牌）。若仓库不是通过 REPO_ROOT 的 git remote 推导，可设置 **GITHUB_REPO=owner/repo**（例如 `ggerganov/llama.cpp`）。
 
-2. **运行阶段 3**：
+2. **运行 GitHub 数据摄取**：
    ```bash
-   python run_stage3.py
+   python scripts/github/ingest_github.py
    ```
    脚本会拉取该仓库全部 Issue 与 PR（含 PR 的变更文件列表），清空 Neo4j 中已有 Issue/PullRequest 后写入，并建立 FIXES 边（PR body 中 fixes #n / closes #n 解析为 PR→Issue）。
 
@@ -112,12 +112,12 @@
 
 ---
 
-## 使用说明（阶段 5 / QA 流水线）
+## 使用说明（QA 流水线）
 
 1. **题目与策略**：见 **`docs/llama_cpp_QA_题目分类与检索策略.md`**。题目来源为项目根目录 **`llama_cpp_QA.csv`**（可由 `export_qa_to_csv.py` 从 xlsx 导出）。
-2. **运行**：先完成阶段 1（Neo4j 中已有代码图），再执行：
+2. **运行**：先完成代码摄取（Neo4j 中已有代码图），再执行：
    ```bash
-   python run_qa.py [--csv PATH] [--limit N] [--output PATH] [--no-llm] [--eval] [--workers N]
+   python scripts/qa/run_qa.py [--csv PATH] [--limit N] [--output PATH] [--no-llm] [--eval] [--workers N]
    ```
    加 `--workers 8` 可并行处理 8 道题，加快全量测试（默认 4）。
    默认读 `llama_cpp_QA.csv`，输出 **JSON**（`qa_retrieval_results.json`），每条含：具体问题、意图、实体名称、路由类型、检索结果、参考答案、生成答案。加 `--eval` 会用 LLM 打 **0–1 分**并写入 `评价分数`、`评价说明`。**类型 A**：实体相关函数 + CALLS；**类型 B**：实体相关函数 + 沿 CALLS 1 跳邻域（架构/流程）；**类型 C**：实体相关函数经 **embedding 相似度**取 top-10 再查 CALLS（.env 需 `EMBEDDING_MODEL`、`OPENAI_API_KEY`）。

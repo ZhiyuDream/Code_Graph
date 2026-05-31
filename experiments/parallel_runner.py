@@ -417,8 +417,8 @@ def main():
             cnt = result.single()["cnt"]
         driver.close()
         if cnt == 0:
-            print("  Neo4j 为空，跳过 Graph-Agent（需先运行 scripts/run_stage1_clangd.py）")
-            print("  请运行: python scripts/run_stage1_clangd.py")
+            print("  Neo4j 为空，跳过 Graph-Agent（需先运行 scripts/src/ingestion/orchestrator.py）")
+            print("  请运行: python scripts/src/ingestion/orchestrator.py")
             print("  然后重新运行: python experiments/parallel_runner.py --skip-rag")
         else:
             t0 = time.time()

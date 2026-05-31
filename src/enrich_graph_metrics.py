@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 为 Function 节点批量写入结构指标：fan_in, fan_out, is_leaf, is_orphan。
 纯 Cypher 计算，无 LLM 调用。
 
 用法：
-  python enrich_graph_metrics.py
+  python src/enrich_graph_metrics.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 支持从项目根目录或 src/ 目录直接运行
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+
 from config import NEO4J_DATABASE
-from neo4j_writer import get_driver
+from src.neo4j_writer import get_driver
 
 
 def enrich(driver, database: str = NEO4J_DATABASE):

@@ -20,12 +20,11 @@ All configuration is in `.env` (loaded by `config.py` via python-dotenv). Requir
 
 ```bash
 # Pipeline stages (run sequentially)
-python scripts/run_stage1.py              # Build code graph in Neo4j via clangd
-python scripts/run_stage2.py              # Discover workflows (BFS on CALLS edges)
-python scripts/run_stage3.py              # Fetch GitHub Issues/PRs
+python scripts/ingestion/ingest_code.py              # Build code graph in Neo4j via clangd
+python scripts/github/ingest_github.py                 # Fetch GitHub Issues/PRs
 
 # QA pipeline (main entry point)
-python scripts/run_qa_final.py --csv datasets/llama_cpp_QA_cleaned.json --output results/output.json --workers 20
+python scripts/qa/run_qa.py --csv datasets/llama_cpp_QA_cleaned.json --output results/output.json --workers 20
 
 # Evaluation
 python tools/eval_benchmark.py eval -i results/output.json -o results/output_evaluated.json -w 20
@@ -35,7 +34,7 @@ python tools/eval_benchmark.py compare -b baseline.json -n new_result.json
 pytest tests/
 
 # Debug a single question
-python scripts/debug_single_question.py
+python scripts/qa/debug_question.py
 ```
 
 ## Architecture
@@ -45,13 +44,13 @@ python scripts/debug_single_question.py
 ```
 config.py               # Central config loader (from .env)
 src/                    # All importable library code
-  pipeline/             # Stage 1 clangd-based graph building
+  ingestion/            # Code graph ingestion (clangd LSP → Neo4j)
   core/                 # Infrastructure: neo4j_client, llm_client, prompt_loader, answer_generator
   search/               # Retrieval: semantic_search, call_chain, grep_search_v2, code_reader
   qa/                   # QA agent (agent.py) and classic RAG (classic_rag.py)
   workflow/             # Workflow discovery (entry_candidates)
   neo4j_writer.py       # Shared Neo4j constraint/write utilities
-scripts/                # CLI entry points (run_stage*.py, run_qa_final.py, eval tools)
+scripts/                # CLI entry points (organized by function: ingestion/, github/, qa/, eval/, analysis/, tools/)
 experiments/            # Experiment scripts and results
 prompts/                # LLM prompt templates (loaded by src/core/prompt_loader.py)
 datasets/               # QA benchmarks
@@ -59,13 +58,13 @@ tests/                  # Unit tests
 data/                   # RAG indexes (gitignored, ~1.1GB)
 ```
 
-### Pipeline (src/pipeline/) -- Graph Building
+### Ingestion (src/ingestion/) -- Graph Building
 
-Orchestrated by `stage1_clangd.py`:
+Orchestrated by `orchestrator.py`:
 
-`LSPClient` (clangd JSON-RPC) -> `symbol_extractor` (documentSymbol + callHierarchy) -> `field_resolver` -> `call_resolver` (RawCall -> precise caller/callee pairs) -> `graph_assembler` (builds nodes/edges dict with Louvain community detection for Modules) -> `neo4j_batch_writer` (UNWIND batch write, 500/batch)
+`LSPClient` (clangd JSON-RPC) -> `symbol_extractor` (documentSymbol + callHierarchy) -> `field_resolver` -> `call_resolver` (RawCall -> precise caller/callee pairs) -> `graph_builder` (builds nodes/edges dict with Louvain community detection for Modules) -> `neo4j_writer` (UNWIND batch write, 500/batch)
 
-Key data models in `src/pipeline/models.py`: `FunctionSymbol`, `ClassSymbol`, `VariableSymbol`, `RawCall`, `FileResult`, `ResolvedCalls`.
+Key data models in `src/ingestion/models.py`: `FunctionSymbol`, `ClassSymbol`, `VariableSymbol`, `RawCall`, `FileResult`, `ResolvedCalls`.
 
 ### Neo4j Graph Model
 
@@ -89,7 +88,7 @@ Edge types: CONTAINS, CALLS, CALLS_AMBIGUOUS, REFERENCES_VAR, HAS_MEMBER, HAS_ME
 
 Other: `file_neighbors.py` (same-file/same-class expansion), `issue_search.py` (GitHub Issues/PRs), `code_reader.py` (read source from files), `frequency_penalty.py` (high-freq function filtering).
 
-### ReAct Agent Loop (scripts/run_qa_final.py)
+### ReAct Agent Loop (scripts/qa/run_qa.py)
 
 Iterative retrieval with up to 5 rounds:
 1. **Initial search**: Semantic search with grep fallback (threshold 0.5)

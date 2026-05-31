@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 V8 + 文件级扩展 对比测试脚本
-基于 run_qa_final.py 添加文件级扩展功能
+基于 scripts/qa/run_qa.py 添加文件级扩展功能
 
 用法:
     # Baseline (无扩展)
