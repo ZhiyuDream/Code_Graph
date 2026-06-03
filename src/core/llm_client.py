@@ -1,44 +1,55 @@
-"""LLM客户端 - 统一的LLM调用层，支持多Provider切换"""
+"""LLM客户端 - 统一的LLM调用层，支持多Provider切换
+
+重构后：
+- 模型配置从 model_config.ModelRegistry 读取，不再硬编码字符串判断
+- 新增模型只需在 ModelRegistry 注册，无需修改此文件
+- 调用层通过 ModelConfig 对象获取 provider/api_key/base_url/max_tokens字段等
+"""
 from __future__ import annotations
 
-import os
-import sys
+import json
+import re
 import time
 import threading
-from pathlib import Path
 from typing import Any
 
-_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_ROOT))
-
+import logging
+import os
 from openai import OpenAI
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL
 
-# 全局客户端实例缓存
-_clients = {}
+from config import LLM_MODEL
+from .model_config import ModelRegistry, ModelConfig
 
-# 线程局部 token usage 记录
-_usage_local = threading.local()
+logger = logging.getLogger(__name__)
 
-def _init_usage():
-    if not hasattr(_usage_local, 'usages'):
-        _usage_local.usages = []
+# 全局客户端实例缓存（key: provider_name）
+_clients: dict[str, OpenAI] = {}
+
+# 全局 token usage 记录（线程安全）
+_usages_lock = threading.Lock()
+_usages_global: list[dict] = []
+
+# 调试日志：记录所有 LLM 调用（prompt / response）
+_debug_calls: list[dict] = []
+_LLMM_DEBUG = os.environ.get("LLM_DEBUG_LOG", "") == "1"
+
 
 def record_usage(usage):
     """记录一次调用的 token usage"""
-    _init_usage()
     if usage:
-        _usage_local.usages.append({
-            'prompt_tokens': getattr(usage, 'prompt_tokens', 0),
-            'completion_tokens': getattr(usage, 'completion_tokens', 0),
-            'total_tokens': getattr(usage, 'total_tokens', 0),
-            'reasoning_tokens': getattr(getattr(usage, 'completion_tokens_details', None), 'reasoning_tokens', 0) or 0,
-        })
+        with _usages_lock:
+            _usages_global.append({
+                'prompt_tokens': getattr(usage, 'prompt_tokens', 0),
+                'completion_tokens': getattr(usage, 'completion_tokens', 0),
+                'total_tokens': getattr(usage, 'total_tokens', 0),
+                'reasoning_tokens': getattr(getattr(usage, 'completion_tokens_details', None), 'reasoning_tokens', 0) or 0,
+            })
+
 
 def get_usage_stats() -> dict:
-    """获取当前线程累计的 token usage 统计"""
-    _init_usage()
-    usages = _usage_local.usages
+    """获取全局累计的 token usage 统计"""
+    with _usages_lock:
+        usages = list(_usages_global)
     if not usages:
         return {}
     return {
@@ -49,48 +60,25 @@ def get_usage_stats() -> dict:
         'reasoning_tokens': sum(u['reasoning_tokens'] for u in usages),
     }
 
+
 def reset_usage_stats():
-    """重置当前线程的 token usage 记录"""
-    _init_usage()
-    _usage_local.usages = []
+    """重置全局 token usage 记录"""
+    with _usages_lock:
+        _usages_global.clear()
 
 
-def get_llm_client(provider: str = "openai") -> OpenAI:
-    """
-    获取LLM客户端实例（支持多Provider）
-    
-    Args:
-        provider: "openai" (默认) 或 "deepseek"
-    """
-    if provider in _clients:
-        return _clients[provider]
-    
-    if provider == "deepseek":
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        base_url = os.environ.get("DEEPSEEK_BASE_URL", "")
-        if not api_key:
-            raise ValueError("DEEPSEEK_API_KEY not set")
-    else:
-        api_key = OPENAI_API_KEY
-        base_url = OPENAI_BASE_URL or None
-    
-    client = OpenAI(api_key=api_key, base_url=base_url or None)
-    _clients[provider] = client
+def _get_client(cfg: ModelConfig) -> OpenAI:
+    """根据 ModelConfig 获取/创建 OpenAI 客户端实例"""
+    key = cfg.provider
+    if key in _clients:
+        return _clients[key]
+
+    if not cfg.api_key:
+        raise ValueError(f"API key not set for provider '{cfg.provider}' (model: {cfg.name})")
+
+    client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url or None)
+    _clients[key] = client
     return client
-
-
-def _get_model_config(model: str):
-    """获取模型配置参数"""
-    # 判断是否需要 max_completion_tokens
-    is_new_openai = model.startswith('gpt-5') or model.startswith('o1') or model.startswith('o3')
-    # DeepSeek 使用 max_tokens
-    is_deepseek = 'deepseek' in model.lower()
-    
-    return {
-        'is_new_openai': is_new_openai,
-        'is_deepseek': is_deepseek,
-        'provider': 'deepseek' if is_deepseek else 'openai',
-    }
 
 
 def call_llm(
@@ -99,57 +87,56 @@ def call_llm(
     timeout: int = 600,
     max_retries: int = 3,
     model: str = None,
-    provider: str = None,
     **extra_kwargs
 ) -> str:
     """
-    带重试机制的LLM调用，支持多Provider
-    
+    带重试机制的LLM调用。
+
     Args:
         messages: 消息列表
         max_tokens: 最大token数
         timeout: 超时时间（秒）
         max_retries: 最大重试次数
         model: 模型名称（默认使用 LLM_MODEL）
-        provider: 提供商（"openai" 或 "deepseek"，默认自动推断）
-        
+        **extra_kwargs: 额外参数（如 response_format）
+
     Returns:
         LLM返回的文本内容
     """
     model = model or LLM_MODEL
-    config = _get_model_config(model)
-    provider = provider or config['provider']
-    client = get_llm_client(provider)
-    
+    cfg = ModelRegistry.resolve(model)
+    client = _get_client(cfg)
+
     for attempt in range(max_retries):
         try:
+            # 先提取内部参数，避免传给 API
+            usage_sink = extra_kwargs.pop('_usage_sink', None)
+
             kwargs = {
-                'model': model,
+                'model': cfg.name,
                 'messages': messages,
-                'timeout': timeout
+                'timeout': timeout,
+                cfg.max_tokens_param: max_tokens,
             }
-            if config['is_new_openai']:
-                kwargs['max_completion_tokens'] = max_tokens
-            else:
-                kwargs['max_tokens'] = max_tokens
             kwargs.update(extra_kwargs)
-            
+
             resp = client.chat.completions.create(**kwargs)
             content = resp.choices[0].message.content or ""
-            
+
             # 记录 token usage
             if hasattr(resp, 'usage') and resp.usage:
-                record_usage(resp.usage)
-            
-            # DeepSeek 可能有 reasoning_content
-            # 注意：如果使用了 response_format={'type': 'json_object'}，
-            # 不应 fallback 到 reasoning_content（reasoning 不是 JSON）
-            is_json_mode = extra_kwargs.get('response_format', {}).get('type') == 'json_object'
-            if not content.strip() and not is_json_mode:
+                if usage_sink is not None:
+                    usage_sink.append(resp.usage)
+                else:
+                    record_usage(resp.usage)
+
+            # DeepSeek 等模型可能有 reasoning_content
+            # JSON mode 下 content 可能为空，但 reasoning_content 有内容，也要 fallback
+            if not content.strip():
                 reasoning = getattr(resp.choices[0].message, 'reasoning_content', '')
                 if reasoning:
                     content = reasoning
-            
+
             return content or "(无答案)"
         except Exception as e:
             error_msg = str(e).lower()
@@ -157,13 +144,13 @@ def call_llm(
                 'timeout', 'connection', 'rate limit', 'too many requests',
                 'temporarily unavailable', 'service unavailable', '503', '502', '504'
             ])
-            
+
             if not retryable or attempt == max_retries - 1:
                 return f"生成答案失败: {e}"
-            
+
             wait_time = 2 ** attempt
             time.sleep(wait_time)
-    
+
     return "生成答案失败: 达到最大重试次数"
 
 
@@ -172,51 +159,44 @@ def call_llm_json(
     max_tokens: int = 500,
     timeout: int = 600,
     model: str = None,
-    provider: str = None
+    _usage_sink: list | None = None,
 ) -> dict | None:
     """
-    调用LLM并解析JSON响应
-    支持 response_format 强制 JSON 输出（DeepSeek/OpenAI）
-    使用 json_repair 做兜底修复
-    
-    Args:
-        messages: 消息列表
-        max_tokens: 最大token数
-        timeout: 超时时间
-        model: 模型名称
-        provider: 提供商
-        
-    Returns:
-        解析后的JSON字典或None
+    调用LLM并解析JSON响应。
+    支持 response_format 强制 JSON 输出（DeepSeek/OpenAI）。
+    使用 json_repair 做兜底修复。
     """
-    import json
-    import re
     from json_repair import repair_json
-    
+
     model = model or LLM_MODEL
-    config = _get_model_config(model)
-    provider = provider or config['provider']
-    
-    # DeepSeek 和 OpenAI 新模型支持 response_format 强制 JSON
-    extra_kwargs = {}
-    if provider == 'deepseek' or config['is_new_openai']:
-        extra_kwargs['response_format'] = {'type': 'json_object'}
-    
-    # DeepSeek reasoning 占用大量 token，JSON 输出需要更大预算
-    if config['is_deepseek'] and max_tokens < 1200:
-        max_tokens = 1200
-    
+    cfg = ModelRegistry.resolve(model)
+
+    # JSON 模式下确保 token 预算足够（DeepSeek reasoning 占用大）
+    if cfg.reasoning_support and max_tokens < cfg.min_json_tokens:
+        max_tokens = cfg.min_json_tokens
+
+    extra = {}
+    if cfg.supports_json_format:
+        extra['response_format'] = {'type': 'json_object'}
+
+    sink = _usage_sink if _usage_sink is not None else []
     content = call_llm(
         messages, max_tokens, timeout,
-        model=model, provider=provider, **extra_kwargs
+        model=model, _usage_sink=sink, **extra
     )
-    
+
+    # 如果没有外部 sink，将收集的 usage 同步到全局（保持兼容性）
+    if _usage_sink is None:
+        for usage in sink:
+            record_usage(usage)
+
     if content.startswith("生成答案失败:"):
         return None
-    
-    # 尝试提取JSON（多层兜底）
+
+    # 多层兜底解析 JSON
     text = content.strip()
-    
+    _original_text = text[:800]  # 保留用于日志
+
     # 1. 提取 ```json 代码块
     if '```json' in text:
         text = text.split('```json')[1].split('```')[0]
@@ -224,31 +204,35 @@ def call_llm_json(
         parts = text.split('```')
         if len(parts) >= 2:
             text = parts[1]
-    
+
     text = text.strip()
     if not text:
+        logger.warning("JSON parse failed: empty content after extracting code block. original=%s", _original_text)
         return None
-    
+
     # 2. 标准 JSON 解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    
-    # 3. json_repair 兜底修复
+
+    # 3. json_repair 兜底修复（return_objects=True 直接返回解析后的对象）
     try:
-        repaired = repair_json(text)
-        return json.loads(repaired)
-    except Exception:
-        pass
-    
+        result = repair_json(text, return_objects=True)
+        if isinstance(result, dict):
+            return result
+    except Exception as e:
+        logger.warning("json_repair failed: %s. text=%s", e, text[:500])
+
     # 4. 尝试提取第一个 {...} 或 [...]
     match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
     if match:
         try:
-            repaired = repair_json(match.group(1))
-            return json.loads(repaired)
-        except Exception:
-            pass
-    
+            result = repair_json(match.group(1), return_objects=True)
+            if isinstance(result, dict):
+                return result
+        except Exception as e:
+            logger.warning("Extract-brace JSON repair failed: %s. text=%s", e, text[:500])
+
+    logger.error("JSON parse completely failed. original=%s", _original_text)
     return None

@@ -5,6 +5,7 @@ LSP 客户端：启动 clangd，维护 JSON-RPC 连接。
 1. request() 增加超时，超时抛出 LSPTimeoutError
 2. stderr 读取线程，输出 clangd 日志便于诊断
 3. 上下文管理器，确保进程终止
+4. 使用 use_process_alive_check 模式避免短超时掐断 clangd 正常工作
 """
 from __future__ import annotations
 
@@ -51,8 +52,8 @@ class LSPClient:
         cmd = [
             exe,
             f"-compile-commands-dir={build_dir}",
-            "-background-index",
             "-log=error",
+            "--background-index=false",
         ]
         proc = subprocess.Popen(
             cmd,
@@ -144,30 +145,62 @@ class LSPClient:
         body = self.proc.stdout.read(length)
         return body.decode(self._ENCODING)
 
-    def request(self, method: str, params: dict[str, Any], timeout: float = 600.0) -> Any:
-        """发送 LSP 请求，等待响应。"""
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None = None,
+        use_process_alive_check: bool = False,
+    ) -> Any:
+        """发送 LSP 请求，等待响应。
+
+        Args:
+            timeout: 绝对安全网超时（秒）。None 表示无限等。
+                     仅在 use_process_alive_check=False 时作为硬 deadline。
+            use_process_alive_check: True 时不设固定 deadline，只要 clangd
+                     进程还在运行就一直等；进程退出才立即失败。
+        """
         LSPClient._request_counter += 1
         req_id = LSPClient._request_counter
         req = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
         self._write_message(json.dumps(req))
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = self._read_message()
-            if msg is None:
-                time.sleep(0.05)
-                continue
-            data = json.loads(msg)
-            if data.get("id") == req_id:
-                if "error" in data:
-                    raise RuntimeError(f"LSP error: {data['error']}")
-                return data.get("result")
-            # notification，忽略
-            if "method" in data:
-                continue
-            time.sleep(0.01)
-
-        raise LSPTimeoutError(f"LSP request '{method}' timed out after {timeout}s")
+        if use_process_alive_check:
+            # 进程存活检测模式：clangd 没死就一直等
+            while True:
+                # 如果进程已退出，说明 crash 了，立刻失败
+                if self.proc.poll() is not None:
+                    raise LSPTimeoutError(
+                        f"LSP request '{method}' aborted: clangd process exited (code={self.proc.returncode})"
+                    )
+                msg = self._read_message(read_timeout=1.0)
+                if msg is None:
+                    time.sleep(0.05)
+                    continue
+                data = json.loads(msg)
+                if data.get("id") == req_id:
+                    if "error" in data:
+                        raise RuntimeError(f"LSP error: {data['error']}")
+                    return data.get("result")
+                if "method" in data:
+                    continue
+        else:
+            # 传统 deadline 模式（保留给 initialize 等快速请求）
+            deadline = time.time() + (timeout if timeout is not None else 600.0)
+            while time.time() < deadline:
+                msg = self._read_message()
+                if msg is None:
+                    time.sleep(0.05)
+                    continue
+                data = json.loads(msg)
+                if data.get("id") == req_id:
+                    if "error" in data:
+                        raise RuntimeError(f"LSP error: {data['error']}")
+                    return data.get("result")
+                if "method" in data:
+                    continue
+                time.sleep(0.01)
+            raise LSPTimeoutError(f"LSP request '{method}' timed out after {timeout}s")
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         """发送 LSP 通知。"""

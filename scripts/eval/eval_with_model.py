@@ -12,17 +12,13 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-_ROOT = Path(__file__).resolve().parent.parent
+_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from openai import OpenAI
-from config import OPENAI_API_KEY, OPENAI_BASE_URL
-
 # 从文件加载 judge prompt
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.core.prompt_loader import load_prompt
+from src.core.llm_client import call_llm
+from src.core.model_config import ModelRegistry
 
 def build_judge_prompt(question: str, reference: str, generated: str) -> str:
     return load_prompt(
@@ -33,13 +29,11 @@ def build_judge_prompt(question: str, reference: str, generated: str) -> str:
     )
 
 
-def judge_single(args):
+def judge_single(item: dict, model_name: str):
     """评估单个题目"""
-    client, item, model_name = args
-    
-    question = str(item.get("具体问题", "") or item.get("question", "") or "")
-    reference = str(item.get("参考答案", "") or item.get("answer", "") or item.get("reference", "") or "")
-    generated = str(item.get("生成答案", "") or item.get("generated", "") or "")
+    question = str(item.get("question", "") or item.get("具体问题", "") or "")
+    reference = str(item.get("reference", "") or item.get("reference_answer", "") or item.get("参考答案", "") or "")
+    generated = str(item.get("generated", "") or item.get("answer", "") or item.get("生成答案", "") or "")
     
     if not generated:
         return item, False, "无生成答案"
@@ -51,19 +45,12 @@ def judge_single(args):
     )
     
     try:
-        kwargs = {
-            'model': model_name,
-            'messages': [{"role": "user", "content": prompt}],
-            'timeout': 600,
-        }
-        # gpt-5.x / o1 / o3 使用 max_completion_tokens
-        if model_name.startswith('gpt-5') or model_name.startswith('o1') or model_name.startswith('o3'):
-            kwargs['max_completion_tokens'] = 300
-        else:
-            kwargs['max_tokens'] = 300
-        
-        resp = client.chat.completions.create(**kwargs)
-        text = (resp.choices[0].message.content or "").strip()
+        text = call_llm(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            timeout=120,
+            model=model_name,
+        )
         
         is_correct = "CORRECT" in text.split('\n')[0].upper() and "INCORRECT" not in text.split('\n')[0].upper()
         
@@ -84,15 +71,10 @@ def main():
     parser.add_argument("-w", "--workers", type=int, default=20, help="并行数")
     args = parser.parse_args()
     
-    client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-    
     data = json.load(open(args.input, "r", encoding="utf-8"))
     print(f"加载 {len(data)} 题，使用模型 {args.model} 评判")
+    print(f"模型配置: {ModelRegistry.resolve(args.model).provider}")
     
-    # 准备任务
-    tasks = [(client, item, args.model) for item in data]
-    
-    results = []
     completed = 0
     correct_count = 0
     save_lock = threading.Lock()
@@ -103,7 +85,7 @@ def main():
                 json.dump(data, f, ensure_ascii=False, indent=2)
     
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(judge_single, task): i for i, task in enumerate(tasks)}
+        futures = {executor.submit(judge_single, item, args.model): i for i, item in enumerate(data)}
         
         for future in as_completed(futures):
             item, is_correct, reason = future.result()
@@ -114,7 +96,7 @@ def main():
                 correct_count += 1
             completed += 1
             
-            if completed % 20 == 0:
+            if completed % 10 == 0:
                 print(f"  已评估 {completed}/{len(data)}，当前正确率 {correct_count/completed*100:.1f}%")
                 save_progress()
     

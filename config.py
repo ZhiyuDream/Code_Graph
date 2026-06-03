@@ -35,6 +35,10 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip()
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini").strip()
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small").strip()
 
+# DeepSeek 配置
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "").strip()
+
 
 def get_compile_commands_path() -> Path | None:
     """返回 compile_commands.json 所在目录的 Path；若未配置则尝试 REPO_ROOT/build。"""

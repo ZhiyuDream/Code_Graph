@@ -9,6 +9,10 @@
 【已扩展调用链】(共{chain_count}条):
 {chain_list}
 
+【已用过的搜索关键词】
+{used_queries}
+（选 grep_search / semantic_search 时，请使用**不同**的关键词）
+
 ---
 
 你是代码检索专家。请根据当前已收集的信息和问题类型，选择最合适的下一步行动。
@@ -16,26 +20,26 @@
 【可用工具】
 {actions}
 
-【决策原则】
-1. 以下情况必须继续扩展（不要选sufficient）：
-   - 当前收集的函数数 <= 3 个
-   - 问题是关于"调用链/依赖关系"但尚未扩展任何caller/callee
-   - 问题是关于"模块/架构设计"但只收集到零散函数，未形成完整图景
-   - 高相关函数（相似度>0.7）的代码明显不足以回答问题
-   - 代码位置类问题但未定位到具体行号或函数
+【决策参考】
+- 如果问题是关于"调用链/依赖关系/谁调用了谁"，expand_callers 或 expand_callees 通常是关键
+# - read_full_file 已禁用：文件太大，会挤占上下文预算
+- 如果当前信息明显不足（<3个相关函数），考虑 grep_search 或 semantic_search 重新检索
+- 如果已收集到5+个相关函数且对其中多个进行了扩展，可以考虑 sufficient
+- 不要重复扩展已标记[已扩展]的函数
 
-2. 调用链/依赖问题 → 优先用 expand_callers / expand_callees
-3. 同文件协作问题 → 用 expand_same_file
-4. 信息已充足 → 用 sufficient（需要至少5个相关函数或高相似度函数>=3个）
-
-【重要】不要重复扩展已标记[已扩展]的函数。
+【字段填写规则】
+- sufficient=true 时：action 填 "sufficient"，target/query 留空
+- grep_search / semantic_search：必须在 query 中给出**新的、不同的**搜索关键词（不能和【已用过的搜索关键词】重复），target 留空
+- expand_callers / expand_callees：target 填函数名（从上方列表中选）
+- read_class：target 填函数名（系统会自动找到对应的类/文件路径）
 
 返回JSON:
 {{
     "thought": "分析现有信息和下一步计划（30字以内）",
-    "sufficient": false,
+    "sufficient": true_or_false,
     "action": "{action_choices}",
-    "target": "目标函数名"
+    "target": "目标函数名（如需）",
+    "query": "搜索关键词（如需）"
 }}
 
 只输出JSON:

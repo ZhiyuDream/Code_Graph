@@ -32,9 +32,14 @@ from src.ingestion.orchestrator import run_full_pipeline
 
 
 def setup_logging() -> None:
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler("/tmp/ingestion_a6cc43c_v5.log", mode="w", encoding="utf-8"),
+    ]
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
     )
 
 
@@ -66,7 +71,7 @@ def main() -> int:
             driver=driver,
             database=NEO4J_DATABASE,
             collect_calls=True,
-            collect_var_refs=True,
+            collect_var_refs=False,
             include_dirs=None,
         )
     except Exception as e:

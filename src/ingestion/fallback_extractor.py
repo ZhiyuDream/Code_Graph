@@ -1,10 +1,13 @@
 """
-LSP 超时时退回到正则提取符号。
+⚠️ DEPRECATED: 此模块不再在常规 pipeline 中使用。
 
-用于处理 clangd 无法在规定时间内完成解析的复杂文件（如大型头文件、
-大量模板实例化的文件）。用正则提取函数/类/变量声明，保证文件不丢失。
+fallback_extractor 基于正则解析 C++，精度远低于 clangd，且会产生大量
+垃圾数据（错误的函数边界、丢失的重载、错误的调用关系等）。
 
-精度低于 LSP，但能保证文件出现在图中。
+如果 clangd 解析失败，应优先修复配置（compile_commands.json、头文件路径
+等），而不是用正则凑合。
+
+此文件保留仅作为独立工具使用，不在 run_extraction_only / process_file 中调用。
 """
 from __future__ import annotations
 

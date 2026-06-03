@@ -72,8 +72,6 @@ def _worker_extract(args) -> list:
             files=file_subset,
             collect_calls=True,
             collect_var_refs=True,
-            extract_macros=True,
-            skip_vendor_calls=True,
         )
         elapsed = time.perf_counter() - t0
         worker_logger.info(

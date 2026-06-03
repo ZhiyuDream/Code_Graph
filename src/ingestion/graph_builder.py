@@ -1,11 +1,11 @@
 """
 图组装器：将解析结果组装成完整的图结构（nodes + edges）。
 
-改进点（相比原 graph_builder.py）：
-1. 两阶段变量引用：先收集所有 Function/Class，再统一处理 var_refs，消除时序盲区
-2. 直接使用 ResolvedCalls，不再自己做 CALLS 匹配
-3. 支持 CALLS_AMBIGUOUS 边（诊断用途）
-4. 保持方案 B：Repository/Directory/File/Function/Class/Variable/Attribute 节点
+核心原则：直接信任 clangd 的符号和调用关系，不在下游做去重或修正。
+- clangd 的 documentSymbol 已经返回准确的符号列表（包含重载）
+- call_resolver 已经做了精确的位置匹配
+- 不需要按 (file_path, name) 去重（这会破坏重载函数）
+- 不需要 "兜底" 关联同名类（会导致错误挂载）
 """
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from .models import ClassSymbol, FileResult, FunctionSymbol, ResolvedCalls, VariableSymbol
-from .control_flow_extractor import ControlFlowBlock, extract_all_control_flow
-from .resource_lifecycle_extractor import ResourceOperation, extract_all_resource_lifecycle
+from .control_flow_extractor import extract_all_control_flow
+from .resource_lifecycle_extractor import extract_all_resource_lifecycle
 from .param_flow_extractor import extract_all_param_flow
 
 try:
@@ -63,74 +63,6 @@ def _file_name(path: str) -> str:
     return Path(path).name
 
 
-def _deduplicate_functions(
-    file_results: list[FileResult],
-) -> tuple[list[FileResult], dict[str, str]]:
-    """
-    同名同文件函数去重。
-
-    策略：按 (file_path, name) 分组，每组保留 body 最长的（行数最多）
-    作为定义节点。如果是声明-only 的组，保留第一个。
-
-    Returns:
-        (去重后的 file_results, old_func_id -> new_func_id 映射)
-    """
-    from collections import defaultdict
-
-    # 按 (file_path, name) 分组
-    groups: dict[tuple[str, str], list[FunctionSymbol]] = defaultdict(list)
-    for fr in file_results:
-        for f in fr.functions:
-            groups[(f.file_path, f.name)].append(f)
-
-    # 选择代表 + 构建映射
-    old_to_new: dict[str, str] = {}
-    representatives: dict[tuple[str, str], FunctionSymbol] = {}
-
-    for key, funcs in groups.items():
-        if len(funcs) == 1:
-            representatives[key] = funcs[0]
-            continue
-
-        # 优先保留 is_definition=True 的
-        defs = [f for f in funcs if f.is_definition]
-        candidates = defs if defs else funcs
-
-        # 在候选中选行数最多的（body 最长）
-        best = max(candidates, key=lambda f: (f.end_line - f.start_line, f.start_line))
-        representatives[key] = best
-
-    # 构建 old -> new 映射
-    for key, funcs in groups.items():
-        rep = representatives[key]
-        for f in funcs:
-            if f.id != rep.id:
-                old_to_new[f.id] = rep.id
-
-    # 更新 file_results：替换函数列表
-    new_file_results: list[FileResult] = []
-    for fr in file_results:
-        new_funcs = []
-        seen_ids = set()
-        for f in fr.functions:
-            key = (f.file_path, f.name)
-            rep = representatives[key]
-            if rep.id not in seen_ids:
-                new_funcs.append(rep)
-                seen_ids.add(rep.id)
-        new_file_results.append(FileResult(
-            file_path=fr.file_path,
-            functions=new_funcs,
-            classes=fr.classes,
-            variables=fr.variables,
-            calls=fr.calls,
-            var_refs=fr.var_refs,
-            raw=fr.raw,
-        ))
-
-    return new_file_results, old_to_new
-
-
 def assemble_graph(
     file_results: list[FileResult],
     resolved_calls: ResolvedCalls,
@@ -149,24 +81,16 @@ def assemble_graph(
     Returns:
         {"nodes": {...}, "edges": {...}}
     """
-    # ---- P0: 去重 ----
-    file_results, id_remap = _deduplicate_functions(file_results)
-
-    def remap_id(fid: str) -> str:
-        return id_remap.get(fid, fid)
-
     # ---- 第一阶段：收集所有全局实体 ----
     file_paths: set[str] = set()
     functions: list[dict[str, Any]] = []
     classes: list[dict[str, Any]] = []
     variables_by_id: dict[str, dict[str, Any]] = {}
-    refs_raw: list[tuple[str, str, int]] = []  # (func_id, var_id, line)
+    refs_raw: list[tuple[str, str, int]] = []
 
-    # 收集所有文件路径
     for fr in file_results:
         file_paths.add(fr.file_path)
 
-    # 函数和类的全局索引
     func_by_id: dict[str, dict[str, Any]] = {}
     class_by_id: dict[str, dict[str, Any]] = {}
 
@@ -184,6 +108,7 @@ def assemble_graph(
                 "start_line": f.start_line,
                 "end_line": f.end_line,
                 "parent_class": f.parent_class,
+                "param_count": f.param_count,
             }
             functions.append(func_node)
             func_by_id[fid] = func_node
@@ -201,7 +126,7 @@ def assemble_graph(
             classes.append(class_node)
             class_by_id[cid] = class_node
 
-        # Variables（合并到全局，确定 parent）
+        # Variables
         for v in fr.variables:
             if v.id in variables_by_id:
                 continue
@@ -210,7 +135,6 @@ def assemble_graph(
             if sf is not None and 0 <= sf < len(fr.functions):
                 parent_type = "Function"
                 parent_id = fr.functions[sf].id or _func_id(fp, fr.functions[sf].name, fr.functions[sf].start_line)
-                parent_id = remap_id(parent_id)
             elif sc is not None and 0 <= sc < len(fr.classes):
                 parent_type = "Class"
                 parent_id = _class_id(fp, fr.classes[sc].name, fr.classes[sc].start_line)
@@ -227,18 +151,16 @@ def assemble_graph(
         for func_idx, var_id, line in fr.var_refs:
             if 0 <= func_idx < len(fr.functions):
                 fid = fr.functions[func_idx].id or _func_id(fp, fr.functions[func_idx].name, fr.functions[func_idx].start_line)
-                fid = remap_id(fid)
                 if fid in func_by_id:
                     refs_raw.append((fid, var_id, line))
 
-    # 跨文件 var_refs（应用去重映射，过滤无效引用）
+    # 跨文件 var_refs
     if var_refs_global:
         for func_id, var_id, line in var_refs_global:
-            new_fid = remap_id(func_id)
-            # 延迟检查：在 func_by_id 构建完成后再验证
-            refs_raw.append((new_fid, var_id, line))
+            if func_id in func_by_id:
+                refs_raw.append((func_id, var_id, line))
 
-    # ---- 第二阶段：变量引用统一聚合（消除时序盲区）----
+    # ---- 第二阶段：变量引用统一聚合 ----
     refs_agg: dict[tuple[str, str], list[int]] = {}
     for func_id, var_id, line in refs_raw:
         key = (func_id, var_id)
@@ -310,11 +232,14 @@ def assemble_graph(
     # File 节点
     for fp in sorted(file_paths):
         file_id = _file_id(fp)
+        suffix = Path(fp).suffix.lstrip(".") or "cpp"
+        if suffix == "h":
+            suffix = "cpp"
         nodes["File"].append({
             "id": file_id,
             "path": fp,
             "name": _file_name(fp),
-            "language": Path(fp).suffix.lstrip(".") or "cpp",
+            "language": suffix,
         })
         parent = _parent_dir(fp)
         if parent and parent in dir_ids:
@@ -325,68 +250,22 @@ def assemble_graph(
             else:
                 edges["CONTAINS"].append((repo_id, file_id, {}))
 
-    # 建立全局 class 索引（用于跨文件 HAS_METHOD 匹配）
-    class_by_name: dict[str, list[dict[str, Any]]] = {}
-    for c in classes:
-        class_by_name.setdefault(c["name"], []).append(c)
-
-    def _find_parent_class(func: dict[str, Any], class_name: str) -> str | None:
-        """
-        查找函数所属的 class 节点 ID。
-
-        策略（按优先级）：
-        1. 同名同文件（精度最高）
-        2. 同名且文件后缀对应（.cpp → .h/.hpp，如 foo.cpp 中的函数找 foo.h 中的 class）
-        3. 同名且在同一目录的头文件中
-        4. 全局同名（兜底，取第一个）
-        """
-        candidates = class_by_name.get(class_name, [])
-        if not candidates:
-            return None
-
-        func_fp = func["file_path"]
-
-        # P1: 同名同文件
-        for c in candidates:
-            if c["file_path"] == func_fp:
-                return c["id"]
-
-        # P2: 文件后缀对应（foo.cpp → foo.h / foo.hpp）
-        func_stem = Path(func_fp).stem
-        func_dir = os.path.dirname(func_fp)
-        for c in candidates:
-            c_fp = c["file_path"]
-            c_stem = Path(c_fp).stem
-            c_dir = os.path.dirname(c_fp)
-            if c_stem == func_stem and c_dir == func_dir:
-                return c["id"]
-
-        # P3: 同一目录的头文件中的 class
-        for c in candidates:
-            c_fp = c["file_path"]
-            c_dir = os.path.dirname(c_fp)
-            if c_dir == func_dir and c_fp.endswith((".h", ".hpp", ".hh")):
-                return c["id"]
-
-        # P4: 全局同名（取第一个，兜底）
-        return candidates[0]["id"]
-
     # Function/Class/Variable 的 CONTAINS 边
     for f in functions:
         edges["CONTAINS"].append((f["file_path"], f["id"], {}))
-        # parent_class -> HAS_METHOD（支持跨文件匹配）
         parent_class = f.get("parent_class")
         if parent_class:
-            class_id = _find_parent_class(f, parent_class)
-            if class_id:
-                edges["HAS_METHOD"].append((class_id, f["id"], {}))
+            # 仅在精确匹配时建立 HAS_METHOD
+            # 不再兜底关联全局同名第一个类
+            class_candidates = [c for c in classes if c["name"] == parent_class and c["file_path"] == f["file_path"]]
+            if class_candidates:
+                edges["HAS_METHOD"].append((class_candidates[0]["id"], f["id"], {}))
 
     for c in classes:
         edges["CONTAINS"].append((c["file_path"], c["id"], {}))
 
     for v in variables_by_id.values():
         edges["CONTAINS"].append((v["parent_id"], v["id"], {}))
-        # Class 成员变量 -> Attribute 节点 + HAS_MEMBER 边
         if v.get("parent_type") == "Class" and v.get("kind") == "member":
             nodes["Attribute"].append({
                 "id": v["id"],
@@ -397,57 +276,43 @@ def assemble_graph(
             })
             edges["HAS_MEMBER"].append((v["parent_id"], v["id"], {}))
 
-    # REFERENCES_VAR 边（过滤无效引用：函数或变量已被删除）
+    # REFERENCES_VAR 边
     valid_var_ids = set(variables_by_id.keys())
     for (func_id, var_id), lines in refs_agg.items():
         if func_id in func_by_id and var_id in valid_var_ids:
             edges["REFERENCES_VAR"].append((func_id, var_id, {"lines": sorted(set(lines))}))
 
-    # CALLS 边（使用 call_resolver 的输出，应用去重映射）
+    # CALLS 边
     seen_calls = set()
     for caller_id, callee_id in resolved_calls.calls:
-        new_caller = remap_id(caller_id)
-        new_callee = remap_id(callee_id)
-        if new_caller == new_callee:
+        if caller_id == callee_id:
             continue
-        call_key = (new_caller, new_callee)
+        call_key = (caller_id, callee_id)
         if call_key not in seen_calls:
-            edges["CALLS"].append((new_caller, new_callee, {}))
+            edges["CALLS"].append((caller_id, callee_id, {}))
             seen_calls.add(call_key)
 
-    # CALLS_AMBIGUOUS 边（去重后若只剩一个候选，升级为 CALLS）
+    # CALLS_AMBIGUOUS 边
     for caller_id, callee_name, candidate_ids in resolved_calls.ambiguous:
-        new_caller = remap_id(caller_id)
-        # 去重映射 + 去重
-        seen = set()
-        remapped_candidates = []
-        for cid in candidate_ids:
-            new_cid = remap_id(cid)
-            if new_cid not in seen:
-                seen.add(new_cid)
-                remapped_candidates.append(new_cid)
-
-        if len(remapped_candidates) == 1:
-            # 去重后唯一，升级为 CALLS
-            callee_cid = remapped_candidates[0]
-            if new_caller != callee_cid:
-                call_key = (new_caller, callee_cid)
+        if len(candidate_ids) == 1:
+            # 只剩一个候选，升级为 CALLS
+            callee_cid = candidate_ids[0]
+            if caller_id != callee_cid:
+                call_key = (caller_id, callee_cid)
                 if call_key not in seen_calls:
-                    edges["CALLS"].append((new_caller, callee_cid, {}))
+                    edges["CALLS"].append((caller_id, callee_cid, {}))
                     seen_calls.add(call_key)
         else:
-            edges["CALLS_AMBIGUOUS"].append((new_caller, f"ambiguous:{callee_name}", {
+            edges["CALLS_AMBIGUOUS"].append((caller_id, f"ambiguous:{callee_name}", {
                 "callee_name": callee_name,
-                "candidates": remapped_candidates,
+                "candidates": candidate_ids,
             }))
 
-    # ---- EXTERNAL_CALLS 边（外部库/系统调用）----
-    # 为外部调用目标创建占位节点（否则 neo4j_writer 因找不到目标节点而跳过）
+    # EXTERNAL_CALLS 边
     seen_external = set()
     external_nodes: list[dict[str, Any]] = []
     for caller_id, callee_name in resolved_calls.external_calls:
-        new_caller = remap_id(caller_id)
-        ext_key = (new_caller, callee_name)
+        ext_key = (caller_id, callee_name)
         if ext_key not in seen_external:
             ext_id = f"external:{callee_name}"
             external_nodes.append({
@@ -455,18 +320,16 @@ def assemble_graph(
                 "name": callee_name,
                 "kind": "external",
             })
-            edges["EXTERNAL_CALLS"].append((new_caller, ext_id, {
+            edges["EXTERNAL_CALLS"].append((caller_id, ext_id, {
                 "callee_name": callee_name,
             }))
             seen_external.add(ext_key)
     nodes["ExternalCall"] = external_nodes
 
-    # ---- CALLS_AMBIGUOUS 的占位节点 ----
-    # 为歧义调用目标创建占位节点（否则 neo4j_writer 因找不到目标节点而跳过）
+    # CALLS_AMBIGUOUS 的占位节点
     ambiguous_nodes: list[dict[str, Any]] = []
     seen_ambiguous = set()
     for caller_id, callee_name, candidate_ids in resolved_calls.ambiguous:
-        new_caller = remap_id(caller_id)
         amb_id = f"ambiguous:{callee_name}"
         if amb_id not in seen_ambiguous:
             ambiguous_nodes.append({
@@ -478,76 +341,93 @@ def assemble_graph(
             seen_ambiguous.add(amb_id)
     nodes["AmbiguousCall"] = ambiguous_nodes
 
-    # ---- P2: Louvain 社区发现 + Module 节点 ----
+    # Module 检测（可选）
     if _LOUVAIN_AVAILABLE:
         _build_module_nodes(nodes, edges, functions, seen_calls)
 
-    # ---- P3: 控制流提取（state_control, error_path 等证据）----
-    cf_blocks = extract_all_control_flow(file_results, repo_root=repo_root)
-    for block in cf_blocks:
-        cf_id = block.id
-        # 去重：同一函数同一行同一类型只保留一个
-        cf_node = {
-            "id": cf_id,
-            "type": block.type,
-            "condition": block.condition,
-            "file_path": block.file_path,
-            "line": block.line,
-            "is_error_path": block.is_error_path,
-            "semantic_type": block.semantic_type,
-            "multi_line": block.multi_line,
-            "full_condition": block.full_condition,
-        }
-        # 检查是否已存在（同一位置可能多个函数重叠）
-        existing_ids = {n["id"] for n in nodes["ControlFlowBlock"]}
-        if cf_id not in existing_ids:
-            nodes["ControlFlowBlock"].append(cf_node)
-            edges["CONTROL_FLOW"].append((block.function_id, cf_id, {
-                "type": block.type,
-                "line": block.line,
-            }))
-
-    # ---- P4: 参数流提取（config_param_flow, param_config 证据）----
-    param_flows = extract_all_param_flow(file_results, repo_root=repo_root)
-    for func_id, flow in param_flows.items():
-        if func_id in func_by_id:
-            # Neo4j 不支持嵌套 Map 作为属性值，序列化为 JSON 字符串
-            func_by_id[func_id]["param_usage_json"] = json.dumps(flow, ensure_ascii=False)
-
-    # ---- P5: 资源生命周期提取（resource_lifecycle 证据）----
-    resource_ops = extract_all_resource_lifecycle(file_results, repo_root=repo_root)
-    for op in resource_ops:
-        op_node = {
-            "id": op.id,
-            "type": op.type,
-            "resource_type": op.resource_type,
-            "file_path": op.file_path,
-            "line": op.line,
-            "variable_name": op.variable_name,
-            "paired_operation_id": op.paired_operation_id,
-        }
-        nodes["ResourceOperation"].append(op_node)
-        edges["MANAGES"].append((op.function_id, op.id, {
-            "operation": op.type,
-            "line": op.line,
-        }))
-        # 如果有配对操作，添加配对边
-        if op.paired_operation_id:
-            edges["MANAGES"].append((op.id, op.paired_operation_id, {
-                "relation": "paired",
-            }))
+    # 辅助提取器（可选，数据质量较低，仅供诊断）
+    _run_optional_extractors(nodes, edges, func_by_id, file_results, repo_root)
 
     logger.info(
         "Graph assembled: %d functions, %d classes, %d variables, %d attributes, "
         "%d calls, %d ambiguous, %d unresolved, %d external, %d control_flow, %d resource_ops, %d modules",
         len(functions), len(classes), len(variables_list), len(nodes["Attribute"]),
         len(resolved_calls.calls), len(resolved_calls.ambiguous), len(resolved_calls.unresolved),
-        len(resolved_calls.external_calls), len(nodes["ControlFlowBlock"]),
-        len(nodes["ResourceOperation"]),
+        len(resolved_calls.external_calls), len(nodes.get("ControlFlowBlock", [])),
+        len(nodes.get("ResourceOperation", [])),
         len(nodes.get("Module", [])),
     )
 
     return {"nodes": nodes, "edges": edges}
+
+
+def _run_optional_extractors(
+    nodes: dict[str, list[dict[str, Any]]],
+    edges: dict[str, list[tuple[str, str, dict[str, Any]]]],
+    func_by_id: dict[str, dict[str, Any]],
+    file_results: list[FileResult],
+    repo_root: str,
+) -> None:
+    """
+    运行可选的辅助提取器（控制流、参数流、资源生命周期）。
+
+    这些提取器基于正则，数据质量低于 clangd 直接提供的信息，
+    仅作为补充，不用于核心调用图构建。
+    """
+    try:
+        cf_blocks = extract_all_control_flow(file_results, repo_root=repo_root)
+        existing_cf_ids: set[str] = set()
+        for block in cf_blocks:
+            cf_id = block.id
+            if cf_id in existing_cf_ids:
+                continue
+            existing_cf_ids.add(cf_id)
+            cf_node = {
+                "id": cf_id,
+                "type": block.type,
+                "condition": block.condition,
+                "file_path": block.file_path,
+                "line": block.line,
+                "is_error_path": block.is_error_path,
+                "semantic_type": block.semantic_type,
+                "multi_line": block.multi_line,
+                "full_condition": block.full_condition,
+            }
+            nodes["ControlFlowBlock"].append(cf_node)
+            edges["CONTROL_FLOW"].append((block.function_id, cf_id, {
+                "type": block.type,
+                "line": block.line,
+            }))
+    except Exception as e:
+        logger.warning("Control flow extraction skipped: %s", e)
+
+    try:
+        param_flows = extract_all_param_flow(file_results, repo_root=repo_root)
+        for func_id, flow in param_flows.items():
+            if func_id in func_by_id:
+                func_by_id[func_id]["param_usage_json"] = json.dumps(flow, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Param flow extraction skipped: %s", e)
+
+    try:
+        resource_ops = extract_all_resource_lifecycle(file_results, repo_root=repo_root)
+        for op in resource_ops:
+            op_node = {
+                "id": op.id,
+                "type": op.type,
+                "resource_type": op.resource_type,
+                "file_path": op.file_path,
+                "line": op.line,
+                "variable_name": op.variable_name,
+                "paired_operation_id": op.paired_operation_id,
+            }
+            nodes["ResourceOperation"].append(op_node)
+            edges["MANAGES"].append((op.function_id, op.id, {
+                "operation": op.type,
+                "line": op.line,
+            }))
+    except Exception as e:
+        logger.warning("Resource lifecycle extraction skipped: %s", e)
 
 
 def _build_module_nodes(
@@ -558,13 +438,6 @@ def _build_module_nodes(
 ) -> None:
     """
     使用 Louvain 算法对函数调用图进行社区发现，构建 Module 节点。
-
-    策略：
-    1. 基于 CALLS 边 + 文件共现构建加权图
-    2. 转为无向图，运行 Louvain 社区发现（低 resolution 产生大社区）
-    3. 过滤小社区，合并到最近的大社区
-    4. 为每个社区创建 Module 节点
-    5. 构建 BELONGS_TO 边和 MODULE_CALLS 边
     """
     import networkx as nx
 
@@ -572,12 +445,10 @@ def _build_module_nodes(
     if len(func_ids) < 10:
         return
 
-    # 1. 构建加权无向图
     G = nx.Graph()
     for f in functions:
         G.add_node(f["id"], name=f["name"], file_path=f.get("file_path", ""))
 
-    # CALLS 边权重 = 1.0
     for caller_id, callee_id, _ in edges.get("CALLS", []):
         if caller_id in func_ids and callee_id in func_ids and caller_id != callee_id:
             if G.has_edge(caller_id, callee_id):
@@ -585,7 +456,6 @@ def _build_module_nodes(
             else:
                 G.add_edge(caller_id, callee_id, weight=1.0)
 
-    # 文件共现边：同一文件中的函数权重 = 0.5
     file_funcs: dict[str, list[str]] = {}
     for f in functions:
         file_funcs.setdefault(f.get("file_path", ""), []).append(f["id"])
@@ -605,52 +475,39 @@ def _build_module_nodes(
                      G.number_of_nodes(), G.number_of_edges())
         return
 
-    # 2. Louvain 社区发现（低 resolution 产生更大社区）
     try:
         partition = community_louvain.best_partition(G, weight="weight", resolution=0.3)
     except Exception as e:
         logger.warning("Louvain community detection failed: %s", e)
         return
 
-    # 3. 合并小社区（< 10 个函数）到最近的大社区
     communities: dict[int, list[str]] = {}
     for func_id, comm_id in partition.items():
         communities.setdefault(comm_id, []).append(func_id)
 
-    # 找出大社区（>= 10 个函数）
     large_communities = {cid: members for cid, members in communities.items() if len(members) >= 10}
     small_communities = {cid: members for cid, members in communities.items() if len(members) < 10}
 
     if large_communities:
-        # 为每个小社区找到最相似的大社区（共享边最多）
         for small_cid, small_members in small_communities.items():
             best_large_cid = None
             best_score = -1
             for large_cid, large_members in large_communities.items():
-                # 计算小社区和大社区之间的连接数
                 score = sum(1 for m in small_members for lm in large_members if G.has_edge(m, lm))
                 if score > best_score:
                     best_score = score
                     best_large_cid = large_cid
-            # 如果没有任何连接，合并到最大的社区
             if best_large_cid is None or best_score == 0:
                 best_large_cid = max(large_communities, key=lambda c: len(large_communities[c]))
-            # 合并
             large_communities[best_large_cid].extend(small_members)
-
         communities = large_communities
-    else:
-        # 如果没有大社区，保留所有社区
-        pass
 
-    # 4. 为每个社区创建 Module 节点
     modules: list[dict[str, Any]] = []
     func_to_module: dict[str, str] = {}
 
     for idx, (comm_id, func_ids_in_comm) in enumerate(communities.items()):
         module_id = f"module:{idx}"
         module_name = _infer_module_name(func_ids_in_comm, G, functions)
-        # 确保模块名唯一
         existing_names = {m["name"] for m in modules}
         if module_name in existing_names:
             module_name = f"{module_name}_{idx}"
@@ -671,12 +528,10 @@ def _build_module_nodes(
 
     nodes.setdefault("Module", []).extend(modules)
 
-    # 4. BELONGS_TO 边
     edges.setdefault("BELONGS_TO", [])
     for fid, module_id in func_to_module.items():
         edges["BELONGS_TO"].append((fid, module_id, {}))
 
-    # 5. MODULE_CALLS 边（模块间调用）
     module_calls: dict[tuple[str, str], int] = {}
     for caller_id, callee_id, _ in edges.get("CALLS", []):
         caller_mod = func_to_module.get(caller_id)
@@ -696,26 +551,14 @@ def _build_module_nodes(
 
 
 def _infer_module_name(func_ids: list[str], G: Any, functions: list[dict[str, Any]]) -> str:
-    """
-    推断模块名称。
-
-    策略（按优先级）：
-    1. 基于文件路径的公共目录
-    2. 基于社区中度数最高的函数名
-    3. 兜底: module_{id}
-    """
-    # 收集文件路径
+    """推断模块名称。"""
     file_paths = [G.nodes[fid].get("file_path", "") for fid in func_ids if G.nodes[fid].get("file_path")]
 
-    # 策略1: 公共目录
     if file_paths:
-        # 统一为目录列表
         dirs = [os.path.dirname(fp).replace("\\", "/") for fp in file_paths]
-        # 找公共目录前缀
         common_dir = os.path.commonprefix(dirs)
         if common_dir:
             common_dir = common_dir.rstrip("/")
-        # 如果公共前缀为空，找最频繁的目录
         if not common_dir:
             from collections import Counter
             common_dir = Counter(dirs).most_common(1)[0][0]
@@ -725,7 +568,6 @@ def _infer_module_name(func_ids: list[str], G: Any, functions: list[dict[str, An
             if parts and parts[-1]:
                 return f"mod_{parts[-1]}"
 
-    # 策略2: 度数最高的函数名
     degrees = {fid: G.degree(fid) for fid in func_ids if fid in G}
     if degrees:
         best_fid = max(degrees, key=degrees.get)
@@ -733,5 +575,4 @@ def _infer_module_name(func_ids: list[str], G: Any, functions: list[dict[str, An
         if best_name:
             return f"mod_{best_name}"
 
-    # 兜底
     return f"module_{func_ids[0].split(':')[-1] if func_ids else 'unknown'}"
