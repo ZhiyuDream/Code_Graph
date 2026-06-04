@@ -47,7 +47,7 @@ def judge_single(item: dict, model_name: str):
     try:
         text = call_llm(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_tokens=2000,
             timeout=120,
             model=model_name,
         )

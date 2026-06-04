@@ -424,7 +424,7 @@ def generate_answer(client, question: str, collected: dict) -> str:
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=1500,
+            max_tokens=4000,
             temperature=0.3
         )
         text = resp.choices[0].message.content or "(无答案)"

@@ -40,7 +40,7 @@ def evaluate_one(raw_item: dict, result: dict) -> dict[str, Any]:
     """评估单题"""
     # 1. 召回覆盖率
     evidence_files = set()
-    for ev in raw_item.get("evidence", []):
+    for ev in raw_item.get("gold_evidence", []):
         if isinstance(ev, dict):
             fp = ev.get("file", "")
             if fp:

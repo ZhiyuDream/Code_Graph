@@ -31,6 +31,7 @@ _usages_global: list[dict] = []
 
 # 调试日志：记录所有 LLM 调用（prompt / response）
 _debug_calls: list[dict] = []
+_debug_lock = threading.Lock()
 _LLMM_DEBUG = os.environ.get("LLM_DEBUG_LOG", "") == "1"
 
 
@@ -67,6 +68,25 @@ def reset_usage_stats():
         _usages_global.clear()
 
 
+def get_debug_calls() -> list[dict]:
+    """获取所有记录的 LLM 调用日志"""
+    with _debug_lock:
+        return list(_debug_calls)
+
+
+def clear_debug_calls():
+    """清空 LLM 调用日志"""
+    with _debug_lock:
+        _debug_calls.clear()
+
+
+def get_llm_client(cfg: ModelConfig = None) -> OpenAI:
+    """获取 OpenAI 客户端实例（兼容旧接口）。"""
+    if cfg is None:
+        cfg = ModelRegistry.resolve(LLM_MODEL)
+    return _get_client(cfg)
+
+
 def _get_client(cfg: ModelConfig) -> OpenAI:
     """根据 ModelConfig 获取/创建 OpenAI 客户端实例"""
     key = cfg.provider
@@ -87,6 +107,7 @@ def call_llm(
     timeout: int = 600,
     max_retries: int = 3,
     model: str = None,
+    _no_reasoning_fallback: bool = False,
     **extra_kwargs
 ) -> str:
     """
@@ -130,13 +151,23 @@ def call_llm(
                 else:
                     record_usage(resp.usage)
 
-            # DeepSeek 等模型可能有 reasoning_content
-            # JSON mode 下 content 可能为空，但 reasoning_content 有内容，也要 fallback
-            if not content.strip():
+            # DeepSeek 等模型可能有 reasoning_content。
+            # 对于普通文本调用，content 为空时 fallback 到 reasoning_content；
+            # 对于 JSON 调用（_no_reasoning_fallback=True），保留空字符串让上层处理。
+            if not content.strip() and not _no_reasoning_fallback:
                 reasoning = getattr(resp.choices[0].message, 'reasoning_content', '')
                 if reasoning:
                     content = reasoning
 
+            if _LLMM_DEBUG:
+                with _debug_lock:
+                    _debug_calls.append({
+                        "model": cfg.name,
+                        "messages": messages,
+                        "response": content,
+                        "reasoning_content": getattr(resp.choices[0].message, 'reasoning_content', '') or '',
+                        "timestamp": time.time(),
+                    })
             return content or "(无答案)"
         except Exception as e:
             error_msg = str(e).lower()
@@ -163,76 +194,90 @@ def call_llm_json(
 ) -> dict | None:
     """
     调用LLM并解析JSON响应。
-    支持 response_format 强制 JSON 输出（DeepSeek/OpenAI）。
-    使用 json_repair 做兜底修复。
+    解析逻辑：提取代码块 → json.loads → json_repair。
+    针对 DeepSeek 等 thinking-mode 模型：
+      - 自动提升 max_tokens（reasoning_content 会消耗大量 token）
+      - content 为空时尝试解析 reasoning_content
+    失败返回 None，由上层处理。
     """
     from json_repair import repair_json
 
     model = model or LLM_MODEL
-    cfg = ModelRegistry.resolve(model)
-
-    # JSON 模式下确保 token 预算足够（DeepSeek reasoning 占用大）
-    if cfg.reasoning_support and max_tokens < cfg.min_json_tokens:
-        max_tokens = cfg.min_json_tokens
-
-    extra = {}
-    if cfg.supports_json_format:
-        extra['response_format'] = {'type': 'json_object'}
-
     sink = _usage_sink if _usage_sink is not None else []
+
+    # DeepSeek v4-pro 等 thinking-mode 模型需要更多 token 预算
+    # reasoning_content 可能消耗 500~1500 tokens，content（JSON）需要额外空间
+    lower_model = model.lower() if model else ""
+    if "deepseek" in lower_model and max_tokens < 2000:
+        max_tokens = 4000
+
+    def _try_parse(text: str) -> dict | None:
+        """尝试从内容中解析 JSON"""
+        text = text.strip()
+        if not text or text.startswith("生成答案失败:"):
+            return None
+
+        # 1. 提取 ```json 代码块
+        if '```json' in text:
+            text = text.split('```json')[1].split('```')[0]
+        elif '```' in text:
+            parts = text.split('```')
+            if len(parts) >= 2:
+                text = parts[1]
+
+        text = text.strip()
+        if not text:
+            return None
+
+        # 2. 标准 JSON 解析
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. json_repair 兜底
+        try:
+            result = repair_json(text, return_objects=True)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+
+        return None
+
+    # 直接调用底层，禁止 reasoning_content → content 的 fallback，
+    # 以便我们自己区分 content 和 reasoning_content。
     content = call_llm(
         messages, max_tokens, timeout,
-        model=model, _usage_sink=sink, **extra
+        model=model, _usage_sink=sink,
+        _no_reasoning_fallback=True,
     )
 
-    # 如果没有外部 sink，将收集的 usage 同步到全局（保持兼容性）
+    # 优先解析 content（最终答案）
+    result = _try_parse(content)
+    if result is not None:
+        if _usage_sink is None:
+            for usage in sink:
+                record_usage(usage)
+        return result
+
+    # 如果 content 为空或解析失败，尝试从 reasoning_content 中提取 JSON
+    # （DeepSeek 等 thinking-mode 模型可能把决策写在思考过程中）
+    if not content.strip():
+        with _debug_lock:
+            if _debug_calls:
+                last_reasoning = _debug_calls[-1].get("reasoning_content", "")
+                if last_reasoning:
+                    result = _try_parse(last_reasoning)
+                    if result is not None:
+                        logger.info("Parsed JSON from reasoning_content fallback")
+                        if _usage_sink is None:
+                            for usage in sink:
+                                record_usage(usage)
+                        return result
+
+    logger.warning("JSON parse failed. content=%s", content[:400])
     if _usage_sink is None:
         for usage in sink:
             record_usage(usage)
-
-    if content.startswith("生成答案失败:"):
-        return None
-
-    # 多层兜底解析 JSON
-    text = content.strip()
-    _original_text = text[:800]  # 保留用于日志
-
-    # 1. 提取 ```json 代码块
-    if '```json' in text:
-        text = text.split('```json')[1].split('```')[0]
-    elif '```' in text:
-        parts = text.split('```')
-        if len(parts) >= 2:
-            text = parts[1]
-
-    text = text.strip()
-    if not text:
-        logger.warning("JSON parse failed: empty content after extracting code block. original=%s", _original_text)
-        return None
-
-    # 2. 标准 JSON 解析
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # 3. json_repair 兜底修复（return_objects=True 直接返回解析后的对象）
-    try:
-        result = repair_json(text, return_objects=True)
-        if isinstance(result, dict):
-            return result
-    except Exception as e:
-        logger.warning("json_repair failed: %s. text=%s", e, text[:500])
-
-    # 4. 尝试提取第一个 {...} 或 [...]
-    match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
-    if match:
-        try:
-            result = repair_json(match.group(1), return_objects=True)
-            if isinstance(result, dict):
-                return result
-        except Exception as e:
-            logger.warning("Extract-brace JSON repair failed: %s. text=%s", e, text[:500])
-
-    logger.error("JSON parse completely failed. original=%s", _original_text)
     return None

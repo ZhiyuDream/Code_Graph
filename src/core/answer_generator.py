@@ -93,7 +93,7 @@ def build_context(collected: Dict) -> str:
 def generate_answer(
     question: str,
     collected: Dict,
-    max_tokens: int = 1000,
+    max_tokens: int = 4000,
     model: str = None,
     provider: str = None
 ) -> str:

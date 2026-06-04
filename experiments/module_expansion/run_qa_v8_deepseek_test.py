@@ -257,7 +257,7 @@ def process_single(driver, client, row: dict, idx: int) -> dict:
     question = row.get('具体问题', '')
     try:
         collected = react_search(driver, client, question)
-        answer = generate_answer(question, collected, max_tokens=1500, model='deepseek-v4-pro', provider='deepseek')
+        answer = generate_answer(question, collected, max_tokens=4000, model='deepseek-v4-pro', provider='deepseek')
         latency = time_mod.time() - start_time
         return {
             "index": idx,

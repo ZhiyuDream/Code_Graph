@@ -25,14 +25,11 @@ class PromptBuilder:
         chains: list[Any],
         action_descriptions: dict[str, str],
     ) -> str:
+        # 简化函数列表：只给名称和路径，不给签名，避免诱导模型进入分析模式
         func_lines = []
         for i, f in enumerate(functions[:10]):
             marker = " [已扩展]" if f.metadata.get("expanded") else ""
-            sig = f.signature or ""
-            sig_display = f" 签名: {sig[:180]}" if sig else ""
-            func_lines.append(
-                f"{i+1}. {f.name} ({f.file_path}, score={f.score:.3f}, source={f.source}){marker}{sig_display}"
-            )
+            func_lines.append(f"{i+1}. {f.name} @ {f.file_path}{marker}")
         if len(functions) > 10:
             func_lines.append(f"   ... 还有 {len(functions)-10} 个函数")
 
@@ -78,10 +75,10 @@ class PromptBuilder:
 
     @staticmethod
     def expansion_decide(question: str, functions: list[Any]) -> str:
+        # 只给函数名和路径，不给签名，避免诱导模型进入代码分析模式
         func_lines = []
         for i, f in enumerate(functions[:15]):
-            sig = f.signature or f.name
-            func_lines.append(f"{i+1}. {f.name} @ {f.file_path}\n   签名: {sig[:150]}")
+            func_lines.append(f"{i+1}. {f.name} @ {f.file_path}")
         return load_prompt(
             "expansion_decide",
             question=question,

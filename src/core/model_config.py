@@ -22,8 +22,6 @@ class ModelConfig:
     base_url: Optional[str] = None     # 自定义 Base URL
     max_tokens_param: str = "max_tokens"  # "max_tokens" 或 "max_completion_tokens"
     supports_json_format: bool = True  # 是否支持 response_format={"type":"json_object"}
-    reasoning_support: bool = False    # 是否可能返回 reasoning_content
-    min_json_tokens: int = 500         # JSON 模式下的最小 max_tokens
     timeout: int = 600                 # 默认超时（秒）
 
     def get_client_kwargs(self, max_tokens: int, **extra) -> dict:
@@ -77,8 +75,6 @@ class ModelRegistry:
                 base_url=DEEPSEEK_BASE_URL or None,
                 max_tokens_param="max_tokens",
                 supports_json_format=True,
-                reasoning_support=True,
-                min_json_tokens=1200,
             )
         else:
             from config import OPENAI_API_KEY, OPENAI_BASE_URL
@@ -90,7 +86,6 @@ class ModelRegistry:
                 base_url=OPENAI_BASE_URL or None,
                 max_tokens_param="max_completion_tokens" if is_new else "max_tokens",
                 supports_json_format=True,
-                reasoning_support=False,
             )
         cls._models[name] = cfg
         return cfg
@@ -127,7 +122,6 @@ class ModelRegistry:
                     base_url=OPENAI_BASE_URL or None,
                     max_tokens_param="max_completion_tokens" if is_new else "max_tokens",
                     supports_json_format=True,
-                    reasoning_support=False,
                 ))
 
         # DeepSeek 模型
@@ -141,8 +135,6 @@ class ModelRegistry:
                     base_url=DEEPSEEK_BASE_URL or None,
                     max_tokens_param="max_tokens",
                     supports_json_format=True,
-                    reasoning_support=True,
-                    min_json_tokens=1200,
                 ))
 
         cls._initialized = True

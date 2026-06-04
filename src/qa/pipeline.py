@@ -11,7 +11,6 @@ from .agent_loop import ReActLoop
 from .prompts import PromptBuilder
 from .retrievers.base import BaseRetriever
 from src.core.llm_client import call_llm, get_usage_stats, reset_usage_stats
-from src.core.model_config import ModelRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -281,12 +280,9 @@ class QAPipeline:
             priority_names=priority_names,
         )
         prompt = PromptBuilder.answer_generation(question, context)
-        # reasoning 模型（如 DeepSeek）需要更多 token 预算
-        cfg = ModelRegistry.resolve(self.model)
-        max_tokens = 8000 if cfg.reasoning_support else 2000
         return call_llm(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
+            max_tokens=8000,
             model=self.model,
             _usage_sink=usage_sink,
         )

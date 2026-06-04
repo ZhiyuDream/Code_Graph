@@ -72,6 +72,127 @@ class GrepRetriever(BaseRetriever):
                 keywords.append(w)
         return keywords[:6]
 
+    def _extract_functions_from_file(self, file_path: str) -> list[dict]:
+        """一次性扫描文件，提取所有函数定义的位置和内容。返回列表用于缓存。"""
+        full_path = Path(file_path)
+        if not full_path.exists():
+            return []
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        except Exception:
+            return []
+        
+        if not lines:
+            return []
+        
+        funcs = []  # [(start_idx, end_idx, name), ...]
+        
+        # 第一步：找到所有可能的函数定义起始行
+        potential_starts = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('//') or stripped.startswith('#'):
+                continue
+            if '(' in stripped and not stripped.endswith(';'):
+                ctrl_keywords = ('if ', 'if(', 'for ', 'for(', 'while ', 'while(', 'switch ', 'switch(', 'catch ', 'catch(')
+                if any(stripped.startswith(kw) for kw in ctrl_keywords):
+                    continue
+                if any(kw in stripped for kw in ['static', 'inline', 'virtual', 'const', 'void', 'int', 'bool', 'auto', 'template', 'struct', 'class', 'explicit', 'extern']):
+                    potential_starts.append(i)
+                elif re.search(r'[\w:]+\s*\(', stripped):
+                    potential_starts.append(i)
+        
+        # 第二步：用大括号匹配找每个函数的结束位置
+        for start in potential_starts:
+            brace_start = -1
+            for i in range(start, min(len(lines), start + 10)):
+                if '{' in lines[i]:
+                    brace_start = i
+                    break
+            if brace_start < 0:
+                continue
+            
+            brace_count = 0
+            end_idx = -1
+            for i in range(brace_start, min(len(lines), start + 500)):
+                for char in lines[i]:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i
+                            break
+                if end_idx >= 0:
+                    break
+            
+            if end_idx < 0:
+                continue
+            
+            # 提取函数名
+            sig_text = ''.join(lines[start:min(brace_start + 1, len(lines))])
+            func_name = ""
+            for match in re.finditer(r'([\w:]+)\s*\(', sig_text):
+                candidate = match.group(1).strip()
+                if candidate.lower() not in {'if', 'for', 'while', 'switch', 'catch', 'return', 'sizeof', 'decltype', 'static_cast', 'dynamic_cast', 'reinterpret_cast', 'const_cast'}:
+                    func_name = candidate
+                    if '::' in func_name:
+                        func_name = func_name.split('::')[-1]
+                    break
+            
+            funcs.append({
+                "start": start,
+                "end": end_idx,
+                "name": func_name or f"line_{start + 1}",
+            })
+        
+        return funcs
+
+    def _extract_function_at_line(self, file_path: str, line_num: int, file_funcs: list[dict] | None = None) -> dict | None:
+        """提取包含指定行的完整函数。file_funcs 用于缓存同一文件的函数边界。"""
+        full_path = Path(file_path)
+        if not full_path.exists():
+            return None
+        
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        except Exception:
+            return None
+        
+        if not lines or line_num < 1 or line_num > len(lines):
+            return None
+        
+        target_idx = line_num - 1
+        
+        # 使用缓存的函数边界，或重新扫描
+        funcs = file_funcs if file_funcs else self._extract_functions_from_file(file_path)
+        
+        # 找到包含 target_idx 的函数（最内层 = start 最大的）
+        containing = []
+        for f in funcs:
+            if f["start"] <= target_idx <= f["end"]:
+                containing.append(f)
+        
+        if not containing:
+            return None
+        
+        best = max(containing, key=lambda x: x["start"])
+        start, end, func_name = best["start"], best["end"], best["name"]
+        
+        func_lines = lines[start:end + 1]
+        content = ''.join(func_lines)
+        
+        return {
+            "name": func_name,
+            "file": file_path,
+            "line": start + 1,
+            "content": content,
+            "start_line": start + 1,
+            "end_line": end + 1,
+        }
+
     def _grep_file(self, keyword: str) -> list[dict]:
         """对单个关键词执行 ripgrep，返回匹配列表。"""
         cmd = [
@@ -88,11 +209,8 @@ class GrepRetriever(BaseRetriever):
             logger.warning("rg command failed or not found")
             return []
 
-        matches = []
-        current_file = None
-        current_lines = []
-        current_start = None
-
+        # 收集所有匹配位置（文件+行号）
+        match_positions = []
         for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
@@ -100,30 +218,27 @@ class GrepRetriever(BaseRetriever):
                 data = json.loads(line)
             except Exception:
                 continue
-
-            msg_type = data.get("type")
-            if msg_type == "begin":
-                current_file = data.get("data", {}).get("path", {}).get("text", "")
-            elif msg_type == "end":
-                if current_file and current_lines:
-                    matches.append({
-                        "file": current_file,
-                        "line": current_start,
-                        "content": "\n".join(current_lines),
-                    })
-                current_file = None
-                current_lines = []
-                current_start = None
-            elif msg_type == "match":
+            if data.get("type") == "match":
                 mdata = data.get("data", {})
+                file_path = mdata.get("path", {}).get("text", "")
                 line_num = mdata.get("line_number", 0)
-                text = mdata.get("lines", {}).get("text", "")
-                if current_start is None:
-                    current_start = line_num
-                current_lines.append(text)
-            elif msg_type == "context":
-                text = data.get("data", {}).get("lines", {}).get("text", "")
-                current_lines.append(text)
+                if file_path and line_num > 0:
+                    match_positions.append((file_path, line_num))
+
+        # 对每个文件只扫描一次函数边界，然后所有匹配复用
+        matches = []
+        seen_funcs = set()
+        file_cache = {}  # file_path -> list of func bounds
+        
+        for file_path, line_num in match_positions:
+            if file_path not in file_cache:
+                file_cache[file_path] = self._extract_functions_from_file(file_path)
+            func_info = self._extract_function_at_line(file_path, line_num, file_cache[file_path])
+            if func_info and func_info["name"] and not func_info["name"].startswith("line_"):
+                key = (file_path, func_info["name"])
+                if key not in seen_funcs:
+                    seen_funcs.add(key)
+                    matches.append(func_info)
 
         return matches
 
@@ -168,13 +283,21 @@ class GrepRetriever(BaseRetriever):
             if rel_path.startswith(str(self.repo_root)):
                 rel_path = rel_path[len(str(self.repo_root)) + 1:]
 
+            func_name = m.get("name", "")
+            # 过滤掉没提取到函数名的结果
+            if not func_name or func_name.startswith("line_"):
+                continue
+
             results.append(RetrievalResult(
-                id=f"grep:{rel_path}:{m['line']}",
-                type="chunk",
+                id=func_name,
+                type="function",
                 content=m["content"],
                 metadata={
+                    "name": func_name,
                     "file_path": rel_path,
-                    "line": m["line"],
+                    "line": m.get("line", 0),
+                    "start_line": m.get("start_line", 0),
+                    "end_line": m.get("end_line", 0),
                     "keyword_hits": _score(m),
                 },
                 score=min(1.0, _score(m) / max(1, len(keywords))),
