@@ -18,7 +18,7 @@ def _load_rag_index() -> dict | None:
     """加载RAG索引文件"""
     global _RAG_INDEX
     if _RAG_INDEX is None:
-        idx_path = Path(__file__).resolve().parent.parent.parent / "data" / "classic_rag_index.json"
+        idx_path = Path(__file__).resolve().parent.parent.parent / "data" / "qa_embedding_index.json"
         if idx_path.exists():
             with open(idx_path, 'r', encoding='utf-8') as f:
                 _RAG_INDEX = json.load(f)
@@ -86,7 +86,7 @@ def search_functions_by_text(
         meta = chunk.get("meta", {})
         func = {
             'name': meta.get('name', ''),
-            'file': meta.get('file', ''),
+            'file_path': meta.get('file_path', ''),
             'text': chunk.get('text', ''),
             'score': sim,
             'source': 'embedding',

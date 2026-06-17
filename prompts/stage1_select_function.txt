@@ -1,0 +1,16 @@
+You are a senior code auditor. A user asks a question about recent code changes in a repository.
+
+Question:
+{question}
+
+We have retrieved the following function candidates using semantic search. Each candidate has an ID, file path, and function information.
+
+{file_summaries}
+
+Your task: Select the ONE candidate function that would be the best starting point to investigate the question.
+
+Important:
+- You MUST select one candidate from the list above.
+- Return ONLY the candidate ID (a single number, e.g., "3").
+- Do not add explanations, function names, or markdown formatting.
+- Even if none of the candidates perfectly match, choose the closest one.

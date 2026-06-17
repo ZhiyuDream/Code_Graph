@@ -205,11 +205,11 @@ def call_llm_json(
     model = model or LLM_MODEL
     sink = _usage_sink if _usage_sink is not None else []
 
-    # DeepSeek v4-pro 等 thinking-mode 模型需要更多 token 预算
-    # reasoning_content 可能消耗 500~1500 tokens，content（JSON）需要额外空间
+    # DeepSeek 等 thinking-mode 模型：取消 max_tokens 限制
+    # reasoning_content 会消耗大量 token，如果设上限可能挤占 content 空间导致 JSON 截断
     lower_model = model.lower() if model else ""
-    if "deepseek" in lower_model and max_tokens < 2000:
-        max_tokens = 4000
+    if "deepseek" in lower_model:
+        max_tokens = None
 
     def _try_parse(text: str) -> dict | None:
         """尝试从内容中解析 JSON"""

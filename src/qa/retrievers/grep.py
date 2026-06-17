@@ -95,7 +95,10 @@ class GrepRetriever(BaseRetriever):
             if not stripped or stripped.startswith('//') or stripped.startswith('#'):
                 continue
             if '(' in stripped and not stripped.endswith(';'):
-                ctrl_keywords = ('if ', 'if(', 'for ', 'for(', 'while ', 'while(', 'switch ', 'switch(', 'catch ', 'catch(')
+                ctrl_keywords = (
+                    'if ', 'if(', 'for ', 'for(', 'while ', 'while(', 'switch ', 'switch(',
+                    'catch ', 'catch(', '} catch', '}catch', 'else if', 'else {', 'else{',
+                )
                 if any(stripped.startswith(kw) for kw in ctrl_keywords):
                     continue
                 if any(kw in stripped for kw in ['static', 'inline', 'virtual', 'const', 'void', 'int', 'bool', 'auto', 'template', 'struct', 'class', 'explicit', 'extern']):
@@ -107,7 +110,12 @@ class GrepRetriever(BaseRetriever):
         for start in potential_starts:
             brace_start = -1
             for i in range(start, min(len(lines), start + 10)):
-                if '{' in lines[i]:
+                if '{' not in lines[i]:
+                    continue
+                # 跳过初始化列表中的 {}，如 new T{} 或 member{}
+                cleaned = re.sub(r'\bnew\s+\w+\{\}', '', lines[i])
+                cleaned = re.sub(r'\w+\{\}', '', cleaned)
+                if '{' in cleaned:
                     brace_start = i
                     break
             if brace_start < 0:
@@ -115,8 +123,13 @@ class GrepRetriever(BaseRetriever):
             
             brace_count = 0
             end_idx = -1
-            for i in range(brace_start, min(len(lines), start + 500)):
-                for char in lines[i]:
+            for i in range(brace_start, len(lines)):
+                line = lines[i]
+                # 对 brace_start 所在行做特殊处理，去掉初始化列表中的 {}
+                if i == brace_start:
+                    line = re.sub(r'\bnew\s+\w+\{\}', '', line)
+                    line = re.sub(r'\w+\{\}', '', line)
+                for char in line:
                     if char == '{':
                         brace_count += 1
                     elif char == '}':
@@ -193,18 +206,21 @@ class GrepRetriever(BaseRetriever):
             "end_line": end + 1,
         }
 
-    def _grep_file(self, keyword: str) -> list[dict]:
+    def _grep_file(self, keyword: str, file_filter: set[str] | None = None) -> list[dict]:
         """对单个关键词执行 ripgrep，返回匹配列表。"""
         cmd = [
             "rg", "-i",
-            "--type", "cpp", "--type", "c",
             "-n", "-C", str(self.context_lines),
             "--json",
-            keyword,
-            str(self.repo_root),
         ]
+        if file_filter:
+            for f in file_filter:
+                cmd.extend(["-g", f])
+        else:
+            cmd.extend(["--type", "cpp", "--type", "c"])
+        cmd.extend([keyword, str(self.repo_root)])
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(self.repo_root))
         except (subprocess.TimeoutExpired, FileNotFoundError):
             logger.warning("rg command failed or not found")
             return []
@@ -223,6 +239,12 @@ class GrepRetriever(BaseRetriever):
                 file_path = mdata.get("path", {}).get("text", "")
                 line_num = mdata.get("line_number", 0)
                 if file_path and line_num > 0:
+                    # ripgrep 返回的路径可能是相对于 repo_root 的 ./xxx
+                    # 转为绝对路径，避免后续文件读取失败
+                    if file_path.startswith("./"):
+                        file_path = str(self.repo_root / file_path[2:])
+                    elif not Path(file_path).is_absolute():
+                        file_path = str(self.repo_root / file_path)
                     match_positions.append((file_path, line_num))
 
         # 对每个文件只扫描一次函数边界，然后所有匹配复用
@@ -234,7 +256,7 @@ class GrepRetriever(BaseRetriever):
             if file_path not in file_cache:
                 file_cache[file_path] = self._extract_functions_from_file(file_path)
             func_info = self._extract_function_at_line(file_path, line_num, file_cache[file_path])
-            if func_info and func_info["name"] and not func_info["name"].startswith("line_"):
+            if func_info and func_info["name"]:
                 key = (file_path, func_info["name"])
                 if key not in seen_funcs:
                     seen_funcs.add(key)
@@ -242,7 +264,12 @@ class GrepRetriever(BaseRetriever):
 
         return matches
 
-    def retrieve(self, question: str, top_k: int = 5) -> list[RetrievalResult]:
+    def retrieve(
+        self,
+        question: str,
+        top_k: int = 0,
+        file_filter: set[str] | None = None,
+    ) -> list[RetrievalResult]:
         if not self.enabled:
             return []
 
@@ -253,9 +280,15 @@ class GrepRetriever(BaseRetriever):
 
         logger.debug("Grep keywords: %s", keywords)
 
+        if file_filter:
+            logger.info(
+                "[Grep] Searching in %d files",
+                len(file_filter),
+            )
+
         all_matches: list[dict] = []
         for kw in keywords:
-            matches = self._grep_file(kw)
+            matches = self._grep_file(kw, file_filter)
             all_matches.extend(matches)
 
         if not all_matches:
@@ -278,7 +311,8 @@ class GrepRetriever(BaseRetriever):
         deduped.sort(key=_score, reverse=True)
 
         results = []
-        for m in deduped[:top_k]:
+        effective_top_k = top_k if top_k and top_k > 0 else len(deduped)
+        for m in deduped[:effective_top_k]:
             rel_path = m["file"]
             if rel_path.startswith(str(self.repo_root)):
                 rel_path = rel_path[len(str(self.repo_root)) + 1:]

@@ -36,17 +36,37 @@ def expand_callers(
     if file_path:
         results = _neo4j_query("""
             MATCH (caller:Function)-[:CALLS]->(callee:Function {name: $name, file_path: $file_path})
+            WITH caller,
+                 CASE
+                     WHEN caller.file_path STARTS WITH 'common/' THEN 3
+                     WHEN caller.file_path STARTS WITH 'src/' THEN 2
+                     WHEN caller.file_path STARTS WITH 'ggml/' THEN 2
+                     WHEN caller.file_path CONTAINS 'tests/' OR caller.file_path CONTAINS 'test-' THEN 0
+                     WHEN caller.file_path CONTAINS 'examples/' THEN 0
+                     ELSE 1
+                 END AS priority
             RETURN caller.name AS name, caller.file_path AS file_path,
                    caller.start_line AS start_line, caller.end_line AS end_line,
                    caller.signature AS signature
+            ORDER BY priority DESC
             LIMIT $limit
         """, {"name": function_name, "file_path": file_path, "limit": limit})
     else:
         results = _neo4j_query("""
             MATCH (caller:Function)-[:CALLS]->(callee:Function {name: $name})
+            WITH caller,
+                 CASE
+                     WHEN caller.file_path STARTS WITH 'common/' THEN 3
+                     WHEN caller.file_path STARTS WITH 'src/' THEN 2
+                     WHEN caller.file_path STARTS WITH 'ggml/' THEN 2
+                     WHEN caller.file_path CONTAINS 'tests/' OR caller.file_path CONTAINS 'test-' THEN 0
+                     WHEN caller.file_path CONTAINS 'examples/' THEN 0
+                     ELSE 1
+                 END AS priority
             RETURN caller.name AS name, caller.file_path AS file_path,
                    caller.start_line AS start_line, caller.end_line AS end_line,
                    caller.signature AS signature
+            ORDER BY priority DESC
             LIMIT $limit
         """, {"name": function_name, "limit": limit})
 

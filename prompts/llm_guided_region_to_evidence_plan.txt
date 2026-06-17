@@ -1,0 +1,17 @@
+You are a senior code auditor investigating a repository. A user asks a question about recent code changes.
+
+Question:
+{question}
+
+We have already retrieved a candidate region of files using semantic search. Below are the contents of these candidate files.
+
+{region_files}
+
+Your task: Based on the question and the actual code content above, decide what to investigate next.
+
+Return a JSON object with exactly these keys:
+- "reasoning": a short chain-of-thought explaining which parts of the code are most relevant to the question and why.
+- "symbols": a list of 1-5 concrete function/class/variable names that are the most important clues. Only include symbols that actually appear in the code above.
+- "files_to_read": a list of up to {max_extra_files} file paths (relative to repo root) that you want to read next to verify the question. You may include files from the candidate region, or files you expect to exist based on symbols/call relationships. Do not rely on any hard-coded priority rules; judge purely by relevance to the question.
+
+Return ONLY the JSON object, no markdown fences.

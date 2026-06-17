@@ -1,0 +1,16 @@
+You are a senior code auditor. A user asks a question about recent code changes in a repository.
+
+Question:
+{question}
+
+We have retrieved the following function candidates using semantic search. Each candidate has an ID, file path, and function name.
+
+{file_summaries}
+
+Your task: Rank ALL candidate functions by how likely they are to be the best starting point for investigating this question. The best candidate should be ranked #1.
+
+Important:
+- Return a JSON array of candidate IDs in ranked order, e.g., [3, 1, 5, 2, 4].
+- Include ALL candidate IDs in the array, ordered from most relevant to least relevant.
+- Do not add explanations or markdown formatting outside the JSON array.
+- If multiple candidates seem equally relevant, rank the one that represents the core mechanism or primary implementation higher.

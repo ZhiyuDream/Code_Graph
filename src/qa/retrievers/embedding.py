@@ -137,7 +137,12 @@ class EmbeddingRetriever(BaseRetriever):
         logger.info("Index saved to %s", self.index_path)
         self._index = None  # 强制下次重新加载
 
-    def retrieve(self, question: str, top_k: int = 5) -> list[RetrievalResult]:
+    def retrieve(
+        self,
+        question: str,
+        top_k: int = 5,
+        file_filter: set[str] | None = None,
+    ) -> list[RetrievalResult]:
         if not self.enabled:
             return []
 
@@ -152,9 +157,26 @@ class EmbeddingRetriever(BaseRetriever):
             return []
 
         scores = []
+        filtered_count = 0
+        total_count = len(index["embeddings"])
+
         for i, emb in enumerate(index["embeddings"]):
+            chunk = index["chunks"][i]
+            if file_filter:
+                chunk_file = chunk.get("meta", {}).get("file_path", "")
+                if chunk_file not in file_filter:
+                    filtered_count += 1
+                    continue
             sim = _cosine_sim(query_emb, emb)
             scores.append((sim, i))
+
+        if file_filter:
+            logger.info(
+                "[Embedding] Filtered %d/%d chunks (%.1f%% in scope)",
+                total_count - filtered_count,
+                total_count,
+                (total_count - filtered_count) / total_count * 100,
+            )
 
         scores.sort(key=lambda x: -x[0])
 

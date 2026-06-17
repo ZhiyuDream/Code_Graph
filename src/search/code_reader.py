@@ -148,16 +148,14 @@ def enrich_function_with_code(func: Dict) -> Dict:
     if not func:
         return func
 
-    file_path = func.get('file', '')
+    # 同时支持 'file_path'（RAG 索引）和 'file'（Neo4j 查询结果）
+    file_path = func.get('file_path', '') or func.get('file', '')
     func_name = func.get('name', '')
     start_line = func.get('start_line')
     end_line = func.get('end_line')
 
-    # 如果已经有文本且足够长，直接使用
-    existing_text = func.get('text', '')
-    if existing_text and len(existing_text) > 200:
-        return func
-
+    # 始终从文件读取完整代码，不依赖索引中缓存的 text
+    # 这样确保返回的是最新、最准确的实现
     # 从文件读取代码
     code = read_function_from_file(
         file_path=file_path,
@@ -222,6 +220,44 @@ def read_full_file(file_path: str) -> str:
     try:
         with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
             return f.read()
+    except Exception as e:
+        return f"// 读取文件失败: {e}"
+
+
+def read_file_lines(file_path: str, start_line: int, end_line: int) -> str:
+    """
+    读取源文件的指定行号范围
+    
+    Args:
+        file_path: 文件路径（相对 REPO_ROOT 或绝对路径）
+        start_line: 起始行号（1-based）
+        end_line: 结束行号（1-based，包含）
+        
+    Returns:
+        指定行范围的文本内容，带行号前缀
+    """
+    if not file_path.startswith('/'):
+        full_path = REPO_ROOT / file_path
+    else:
+        full_path = Path(file_path)
+    
+    if not full_path.exists():
+        return f"// 文件不存在: {file_path}"
+    
+    try:
+        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        
+        start = max(0, start_line - 1)
+        end = min(len(lines), end_line)
+        
+        if start >= len(lines):
+            return f"// 行号超出范围: {file_path} 只有 {len(lines)} 行"
+        
+        result = []
+        for i in range(start, end):
+            result.append(f"{i+1:4d} | {lines[i]}")
+        return ''.join(result)
     except Exception as e:
         return f"// 读取文件失败: {e}"
 

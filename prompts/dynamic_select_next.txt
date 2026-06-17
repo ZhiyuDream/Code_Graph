@@ -1,0 +1,36 @@
+你正在调查代码仓库以回答问题。
+
+【原始问题】
+{question}
+
+【当前搜索目标】
+{next_search_target}
+
+【已访问文件】
+{visited_files}
+
+【候选文件队列（frontier）】
+{frontier_files}
+
+【最新证据】
+{latest_evidence}
+
+---
+
+【要求】
+1. 总结你刚从文件中读到的新证据（new_evidence）。只陈述事实，不要猜测。
+2. 说明这个证据如何改变了你下一步的搜索方向（decision_impact）。例如：
+   - "发现 A 调用了 B，因此搜索方向从 A 转向 B"
+   - "发现 B 的实现与调用方假设不一致，因此需要查看所有调用 B 的地方"
+   - "发现没有新信息，因此返回去检查其他候选文件"
+3. 明确下一个搜索目标（next_search_target），可以是一个函数名、一个模块、或一个调用路径。
+4. 从候选队列中选择一个最相关的文件作为下一步动作（next_action），格式为 `read_file:path/to/file.cpp`。
+5. 避免选择与已访问文件同类型且无新信息的冗余文件。
+
+【输出格式】（必须是合法 JSON，不要有任何额外文字）
+{{
+  "new_evidence": "从刚读到的文件中发现的具体事实",
+  "decision_impact": "这个事实如何改变了我的搜索方向",
+  "next_search_target": "下一个要调查的目标（函数/模块/路径）",
+  "next_action": "read_file:path/to/file.cpp"
+}}

@@ -1,0 +1,40 @@
+你是一位代码审计专家。请从当前阅读的代码文件中提取与问题相关的关键证据，并指出这些证据让你对哪些符号/文件产生怀疑。
+
+【问题】
+{question}
+
+【当前文件】
+{file_path}
+
+【当前搜索焦点】
+{current_question}
+
+【文件中检测到的候选符号】
+{candidate_symbols}
+
+【文件内容】
+{content}
+
+【要求】
+1. 提取与问题直接相关的 2-4 个关键事实（fact）。
+2. 基于这些事实，用一句话更新你的调查假设（new_hypothesis）。
+3. **suspicious_symbols 必须且只能从上面的【候选符号】中选取**，数量严格限制在 2-5 个，按与问题的相关程度排序。
+4. 禁止返回未在候选符号中出现的函数名、宏或变量名。
+5. suspicious_files 应该是根据当前证据最值得下一步调查的 2-4 个文件路径（相对路径，如 `ggml/src/...` 或 `src/...`）。
+
+【输出格式】（必须是合法 JSON，不要有任何额外文字）
+{{
+  "key_facts": [
+    "事实1",
+    "事实2"
+  ],
+  "new_hypothesis": "基于这些事实，我对问题的新判断",
+  "suspicious_symbols": [
+    "symbol1",
+    "symbol2"
+  ],
+  "suspicious_files": [
+    "path/to/file1.cpp",
+    "path/to/file2.cpp"
+  ]
+}}

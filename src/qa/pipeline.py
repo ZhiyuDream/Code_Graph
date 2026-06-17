@@ -34,6 +34,8 @@ class QAPipeline:
         enable_react: bool = True,
         model: str | None = None,
         repo_root: str = "",
+        scope_planner=None,
+        enable_symbol_fastpath: bool = True,
     ):
         self.retrievers = retrievers
         self.expander = expander or CodeExpander()
@@ -41,6 +43,8 @@ class QAPipeline:
         self.enable_react = enable_react
         self.model = model
         self.repo_root = repo_root
+        self.scope_planner = scope_planner
+        self.enable_symbol_fastpath = enable_symbol_fastpath
         self.react_loop = ReActLoop(
             repo_root=repo_root,
             max_steps=max_react_steps,
@@ -72,7 +76,8 @@ class QAPipeline:
             )
 
             # -------- 2. ReAct Loop (optional) --------
-            if self.enable_react and functions:
+            # 即使 initial_search 返回空，也进入 ReAct，让 LLM 自主决定第一步工具
+            if self.enable_react:
                 functions, issues = self._react_loop(
                     question, functions, issues, tracer, usage_sink
                 )
@@ -107,17 +112,52 @@ class QAPipeline:
         return result
 
     def _initial_search(self, question: str) -> tuple[list[RetrievedFunction], list]:
-        """初始召回：调用所有 enabled retrievers，合并去重"""
-        all_results = []
-        for retriever in self.retrievers:
-            if not retriever.is_available():
-                continue
-            try:
-                results = retriever.retrieve(question, top_k=10)
-                logger.debug("%s retrieved %d results", retriever.name, len(results))
-                all_results.extend(results)
-            except Exception as e:
-                logger.warning("Retriever %s failed: %s", retriever.name, e)
+        """初始召回：优先 Symbol-Centric Fast Path，fallback 到全局搜索。"""
+
+        # ========== Fast Path 1: Symbol-Centric Direct Jump ==========
+        from .query_analyzer import QueryAnalyzer
+        from .symbol_search import grep_symbol_files
+
+        analyzer = QueryAnalyzer(model=self.model)
+        analysis = analyzer.analyze(question)
+
+        logger.info(
+            "[Pipeline] Query analysis: type=%s, symbols=%s, components=%s, conf=%.2f",
+            analysis.query_type, analysis.symbols, analysis.components, analysis.confidence,
+        )
+
+        if self.enable_symbol_fastpath and analysis.query_type == "symbol_centric" and analysis.symbols:
+            symbol = analysis.symbols[0]
+            sym_files = grep_symbol_files(symbol, self.repo_root)
+            if sym_files:
+                logger.info(
+                    "[Pipeline] Symbol fast path: '%s' → %d files",
+                    symbol, len(sym_files),
+                )
+                file_filter = set(sym_files)
+
+                all_results = []
+                for retriever in self.retrievers:
+                    if not retriever.is_available():
+                        continue
+                    try:
+                        if retriever.name == "grep":
+                            # 用 symbol 本身做 grep，限制在相关文件内
+                            results = retriever.retrieve(symbol, file_filter=file_filter)
+                            logger.debug("grep retrieved %d results", len(results))
+                            all_results.extend(results)
+                        # embedding 不再硬调，留给 LLM 在 ReAct 中自主决定
+                    except Exception as e:
+                        logger.warning("Retriever %s failed: %s", retriever.name, e)
+
+                return self._merge_results(all_results)
+
+        # 非 symbol_centric：不硬灌任何检索结果，让空状态进入 ReAct，由 LLM 自主决定工具
+        logger.info("[Pipeline] No symbol fast path, entering ReAct with empty context")
+        return self._merge_results([])
+
+    def _merge_results(self, all_results: list) -> tuple[list[RetrievedFunction], list]:
+        """合并去重检索结果，分离 Issue 和 Function。"""
 
         # 去重：按 name + file_path
         seen = set()

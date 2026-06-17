@@ -111,6 +111,8 @@ class CodeExpander:
     def build_signature_context(self, functions: list[RetrievedFunction]) -> str:
         """构建仅含签名的上下文（最省token）"""
         lines = ["【相关函数签名列表】"]
+        if len(functions) > 15:
+            lines.append(f"（共 {len(functions)} 个函数，按代码中出现顺序排列）")
         for i, f in enumerate(functions, 1):
             sig = f.signature or f.name
             lines.append(f"{i}. {f.name} @ {f.file_path}:{f.start_line}-{f.end_line}")

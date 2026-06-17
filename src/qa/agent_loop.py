@@ -18,8 +18,8 @@ from src.core.llm_client import call_llm_json
 logger = logging.getLogger(__name__)
 
 _ACTIONS = {
-    "grep_search": "用新的关键词进行grep代码搜索",
-    "semantic_search": "用新的查询进行embedding语义搜索",
+    "grep_search": "用精确关键词进行grep代码搜索（适合已知函数名/标识符）",
+    "semantic_search": "用自然语言描述进行embedding语义搜索（适合不确定关键词、概念模糊时）",
     "expand_callers": "扩展目标函数的调用者（上游）",
     "expand_callees": "扩展目标函数的被调用者（下游）",
     "read_class": "读取目标函数所在类/文件的完整实现",
@@ -90,7 +90,8 @@ class ReActLoop:
 
         action = result.get("action", "")
         if action not in _ACTIONS:
-            action = "expand_callees"
+            logger.warning("LLM returned unknown action: %s, forcing sufficient", action)
+            return {"sufficient": True, "action": "sufficient", "target": "", "query": "", "thought": result.get("thought", "") + f" [unknown action: {action}]"}
 
         return {
             "sufficient": False,
