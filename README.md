@@ -1,138 +1,140 @@
 # Code_Graph
 
-面向**大型 C++ 仓库的代码理解**：构建代码图（code graph），支持仓库级问答与执行流程/工作流类问题。
+面向大型 C++ 仓库（以 [llama.cpp](https://github.com/ggerganov/llama.cpp) 为主）的**事后审计问答（post-hoc repository audit QA）**研究框架。
 
-## 目标
+## 当前研究目标
 
-- **节点**：函数、文件、类（可选）
-- **边**：函数调用关系、定义关系
-- **用途**：辅助阅读、RAG 检索、**工作流/流程类问题**（如：关机流程、初始化顺序、请求到达时的执行路径），以及基于调用图的流程重建（entry → 沿调用图展开 → 汇总为 workflow）。
+解决仓库级技术问题的端到端流程中，LLM 在**已到达正确代码区域后仍无法定位关键证据函数**的问题。
 
-## 前置条件
-
-1. **compile_commands.json**  
-   目标仓库（如 llama.cpp）需能生成该文件。llama.cpp 已开启 `CMAKE_EXPORT_COMPILE_COMMANDS ON`，在仓库根目录执行例如：
-   ```bash
-   mkdir -p build && cd build && cmake ..
-   ```
-   会在 `build/compile_commands.json` 生成编译数据库。解析脚本需要指向该文件或将其复制/链接到约定路径。
-
-2. **clangd（可选，用于 IDE 解析）**  
-   若希望编辑器/IDE 用 clangd 解析全部 C++ 文件，需在系统上安装 clangd，并让 clangd 使用上述 `compile_commands.json`（例如在项目根放置或通过 `-compile-commands-dir` 指定）。  
-   当前服务器若未安装，见项目根目录 `项目编写历史.md` 中的安装说明。
-
-3. **图提取脚本的依赖**  
-   本目录下的调用图/代码图提取脚本基于 **clangd LSP**（Language Server Protocol）实现，依赖 `compile_commands.json` 与 clangd 运行时。clangd 20+ 提供准确的跨文件调用解析能力。
-
-## 目录与脚本（规划）
-
-- **代码摄取（已实现）**：  
-  - `scripts/ingestion/ingest_code.py`：基于 **clangd LSP**（documentSymbol + call hierarchy），与 IDE 行为一致，跨文件 CALLS 解析准确；需本机安装 **clangd 20+**，首次运行可能较慢（llama.cpp 规模约数分钟）。  
-  采用方案 B（显式层级：Repository→Directory→File→Function/Class）。
-  - `scripts/ingestion/ingest_code_incremental.py`：基于 git diff 的增量更新。
-- **Workflow 发现**：从 Neo4j 发现入口候选（图结构：无 CALLS 入边的 Function），沿 CALLS 展开得到调用子图，创建 Workflow 节点及 WORKFLOW_ENTRY、PART_OF_WORKFLOW 写入 Neo4j。详见 `docs/STAGE2_实现与目录约定.md`。
-- **GitHub 数据摄取（已实现）**：`scripts/github/ingest_github.py` 使用 `.env` 中的 **GITHUB_TOKEN** 调用 GitHub API，拉取仓库 Issue 与 Pull Request，写入 Neo4j（Issue、PullRequest 节点；PR 含 changed_paths；FIXES 边 PR→Issue）。查询「该 PR 涉及哪些函数」时用 Function.file_path 与 PR.changed_paths 匹配。
-- **环境变量**（.env）：`NEO4J_*`；`REPO_ROOT`（仓库根目录）；可选 `COMPILE_COMMANDS_DIR`；阶段 3 需 `GITHUB_TOKEN`，可选 `GITHUB_REPO=owner/repo`（未设置时从 REPO_ROOT 的 git remote 推导）。
-
-## 与整体 pipeline 的关系
+核心流程：
 
 ```
-仓库（如 llama.cpp）
-  → compile_commands.json（CMake 生成）
-  → 本目录脚本：解析 → 代码图（函数/文件/类 + 调用/定义边）
-  → 后续：函数摘要与 embedding、RAG 检索、workflow 问题下的 call-graph 展开与 LLM 汇总
+Question
+  → Relevant Code Region     (file-level retrieval)
+  → Candidate Symbol Set     (function-level candidate construction)
+  → Evidence-bearing Symbol  (symbol discrimination / selection)
+  → Expansion                (callers / callees / same-file neighbors)
+  → Answer
 ```
 
-详细需求与方案选择见根目录 `项目编写历史.md`。
+## 关键发现
 
----
+基于 `datasets/benchmark_hard.json`（50 题）和最近的分解实验：
 
-## 使用说明（代码摄取）
+| Stage | Recall / Coverage |
+|-------|-------------------|
+| File-level retrieval @10 | ~90% |
+| Global function retrieval @10 | ~47% |
+| Two-stage candidate construction (20 files × 5 funcs) | ~80% |
+| LLM multi-selection recall | ~53% |
+| Oracle expansion coverage | ~80% |
 
-1. **准备 compile_commands.json**  
-   在待解析仓库（如 llama.cpp）根目录执行：`mkdir -p build && cd build && cmake ..`，得到 `build/compile_commands.json`。
+**结论**：
+- **文件检索**已经不是主要瓶颈。
+- **函数级候选构造**（从相关文件内召回函数）能显著提升上限。
+- **候选判别**（从一堆语义相关函数中选出真正承载证据的函数）仍是核心难题。
+- 调用图 expansion 本身天花板很高；问题在于 expansion 的起点选择。
 
-2. **配置 .env**  
-   在 `Code_Graph/.env` 中设置：
-   - `REPO_ROOT`：仓库根目录的绝对路径（例如 `/data/yulin/RUC/llama.cpp`）。
-   - `NEO4J_URI`、`NEO4J_USERNAME`、`NEO4J_PASSWORD`、`NEO4J_DATABASE`（若尚未配置）。
+## 评测标准
 
-3. **（可选）创建 conda 环境**  
-   若需独立环境，可在本机执行：
-   ```bash
-   conda create -n code_graph python=3.11
-   conda activate code_graph
-   pip install -r requirements.txt
-   ```
-   若系统缺少 libclang 动态库，可安装：`conda install -c conda-forge libclang` 或系统包（如 `libclang-14-dev`），并按需设置 `LIBCLANG_PATH`。
+采用 **post-hoc audit benchmark**：
 
-4. **运行代码摄取**（需要 clangd 20+）
-   ```bash
-   python scripts/ingestion/ingest_code.py
-   ```
-   首次运行会启动 clangd 守护进程并索引代码，可能需要数分钟（llama.cpp 规模）。
-   脚本会清空 Neo4j 中现有代码图、写入新图并更新 `Repository.last_processed_commit`。
+- 每题包含人工标注的 `gold_evidence`，即回答问题所需的关键代码位置（文件 + 行号区间）。
+- 核心指标：**Coverage** = 模型召回的证据文件数 / 总 gold evidence 文件数。
+  - `avg_coverage`：每题 coverage 的平均值。
+  - `full_coverage_rate`：完全覆盖所有 gold evidence 的题目比例。
+- 辅助指标：
+  - `file_recall@k`：gold 文件是否进入 top-k 文件。
+  - `symbol_recall@k`：gold 函数是否进入 top-k 函数候选。
+  - `selection_recall`：LLM 是否从候选中选中 gold 函数。
 
-**注意**：跨文件调用解析需要 **clangd 20+**。若安装的是 clangd 14-19，CALLS 边将为空。
-可通过 `clangd --version` 检查版本。安装最新版：[LLVM 官网](https://releases.llvm.org/)。
+详见 `evals/eval_v2.py` 和 `datasets/benchmark_hard.json`。
 
----
+## 目录结构
 
----
+```
+Code_Graph/
+├── config.py                  # 统一配置加载（.env）
+├── src/
+│   ├── ingestion/             # 基于 clangd LSP 的代码图构建
+│   ├── core/                  # Neo4j 客户端、LLM 客户端、prompt 加载
+│   ├── search/                # 语义检索、调用链扩展、grep、代码读取
+│   └── qa/                    # QA agent、检索器、调查策略
+├── scripts/
+│   ├── ingestion/             # 建图入口
+│   ├── github/                # Issue / PR 摄取
+│   ├── qa/                    # QA 流水线入口
+│   ├── eval/                  # 评测脚本
+│   └── analysis/              # 各种分析脚本
+├── experiments/               # 研究实验脚本
+├── prompts/                   # LLM prompt 模板
+├── datasets/                  # benchmark 数据
+├── evals/                     # 评测逻辑
+├── docs/research/             # 研究笔记、实验报告
+└── results/                   # 实验结果（gitignored）
+```
 
-## 使用说明（Workflow 发现）
+## 快速开始
 
-1. **前置**：先完成代码摄取（`scripts/ingestion/ingest_code.py`），Neo4j 中已有 Function、CALLS 等。
+### 1. 环境
 
-2. **运行 Workflow 发现**：
-   ```bash
-   # Workflow 发现脚本（若存在）
-   ```
-   脚本会：从图中发现入口候选（无 CALLS 入边的 Function）→ 沿 CALLS BFS 展开 → 清空已有 Workflow 后写入新 Workflow 节点及 WORKFLOW_ENTRY、PART_OF_WORKFLOW。
+```bash
+conda create -n code_graph python=3.11
+conda activate code_graph
+pip install -r requirements.txt
+```
 
-3. **展开参数**：默认深度 5、单 Workflow 节点数上限 500；可通过环境变量覆盖：
-   - `WORKFLOW_DEPTH_LIMIT`（默认 5）
-   - `WORKFLOW_NODE_LIMIT`（默认 500）
+复制 `env.example.yml` 为 `.env` 并填写：
+- `REPO_ROOT`：目标仓库绝对路径，如 `/data/users/zzy/RUC/llama.cpp`
+- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`
+- `OPENAI_API_KEY`, `OPENAI_BASE_URL`
+- `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`
 
-实现细节与推荐目录结构见 **`docs/STAGE2_实现与目录约定.md`**。
+### 2. 构建代码图
 
----
+目标仓库需先生成 `compile_commands.json`：
 
-## 使用说明（GitHub 数据摄取）
+```bash
+cd $REPO_ROOT
+mkdir -p build && cd build
+cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..
+```
 
-1. **配置**：在 `.env` 中设置 **GITHUB_TOKEN**（GitHub 个人访问令牌）。若仓库不是通过 REPO_ROOT 的 git remote 推导，可设置 **GITHUB_REPO=owner/repo**（例如 `ggerganov/llama.cpp`）。
+然后运行摄取脚本（需要 clangd 20+）：
 
-2. **运行 GitHub 数据摄取**：
-   ```bash
-   python scripts/github/ingest_github.py
-   ```
-   脚本会拉取该仓库全部 Issue 与 PR（含 PR 的变更文件列表），清空 Neo4j 中已有 Issue/PullRequest 后写入，并建立 FIXES 边（PR body 中 fixes #n / closes #n 解析为 PR→Issue）。
+```bash
+python scripts/ingestion/ingest_code.py
+```
 
-3. **查询示例**：该 PR 涉及哪些函数（通过 file_path 匹配）：在应用层用 `Function.file_path IN pr.changed_paths` 或路径前缀匹配；或 Cypher 中先取 PR 的 changed_paths，再 `MATCH (f:Function) WHERE f.file_path IN $paths`。
+### 3. 运行实验
 
----
+以当前核心实验为例：
 
-## 使用说明（QA 流水线）
+```bash
+# 检索 vs 选择分解实验
+python experiments/run_retrieval_selection_decomposition.py --range 0,15 -w 5
 
-1. **题目与策略**：见 **`docs/llama_cpp_QA_题目分类与检索策略.md`**。题目来源为项目根目录 **`llama_cpp_QA.csv`**（可由 `export_qa_to_csv.py` 从 xlsx 导出）。
-2. **运行**：先完成代码摄取（Neo4j 中已有代码图），再执行：
-   ```bash
-   python scripts/qa/run_qa.py [--csv PATH] [--limit N] [--output PATH] [--no-llm] [--eval] [--workers N]
-   ```
-   加 `--workers 8` 可并行处理 8 道题，加快全量测试（默认 4）。
-   默认读 `llama_cpp_QA.csv`，输出 **JSON**（`qa_retrieval_results.json`），每条含：具体问题、意图、实体名称、路由类型、检索结果、参考答案、生成答案。加 `--eval` 会用 LLM 打 **0–1 分**并写入 `评价分数`、`评价说明`。**类型 A**：实体相关函数 + CALLS；**类型 B**：实体相关函数 + 沿 CALLS 1 跳邻域（架构/流程）；**类型 C**：实体相关函数经 **embedding 相似度**取 top-10 再查 CALLS（.env 需 `EMBEDDING_MODEL`、`OPENAI_API_KEY`）。
-3. **当前实现**：按意图/问题类型路由到类型 A/B/C；类型 A 已用 Cypher 查「实体相关函数 + 调用关系」，类型 B/C 为占位。默认会调用 LLM 根据检索结果生成答案。
+# 文件 / 函数召回分解
+python experiments/run_file_symbol_recall_decomposition.py --range 0,15
 
----
+# 端到端函数级 pipeline
+python experiments/run_end_to_end_function_pipeline.py --range 0,15 -w 5
+```
 
-## 整体方案（流程理解 + 入库 + PR/Issue + 增量更新）
+### 4. 评测
 
-已在本目录撰写 **`DESIGN.md`**，包含：
+```bash
+python evals/eval_v2.py -i results/<output>.json -o results/<output>_eval.json
+```
 
-- **Neo4j 图模型**：Repository / Commit / File / Function / Class / Workflow / Issue / PullRequest 及关系（CALLS, CONTAINS, PART_OF_WORKFLOW, CHANGED_IN, REFERENCES 等），支持版本与增量。
-- **Pipeline 分阶段**：代码图采集 → 流程理解与入库 → Issue/PR 采集与关联 → 仓库变更时的增量更新。
-- **流程理解方式**：基于调用图展开、LLM 总结、与 Issue/文档结合等，可组合使用。
-- **PR/Issue**：数据来源（如 GitHub API）、与代码的关联方式、更新策略。
-- **增量更新**：基于 `last_processed_commit` 与 `git diff` 只重算变更文件，更新 Neo4j。
+## 重要研究文档
 
-实现顺序建议与需您确认的选项见 `DESIGN.md` 第八节。配置（Neo4j、OpenAI、LLM/Embedding 模型等）从项目根目录 `.env` 读取。
+- `docs/research/0616/repository_audit_function_localization.md`：最新研究方向
+- `docs/research/0613/oracle_coverage_gap_analysis.md`：oracle expansion 分析
+- `docs/research/0610/hard_benchmark_retrieval_failure_analysis.md`：困难 benchmark 检索失败分析
+
+## 注意事项
+
+- 跨文件调用解析依赖 **clangd 20+**；clangd 14–19 会产生空 CALLS 边。
+- 实验结果默认写入 `results/`（已 gitignore）。
+- 当前活跃分支：`feat/navigation-architecture`。
