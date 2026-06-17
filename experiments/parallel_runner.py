@@ -23,10 +23,9 @@ from datetime import datetime
 _FILE = Path(__file__).resolve()
 _ROOT = _FILE.parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
-sys.path.insert(0, str(_ROOT / "tools"))
 sys.path.insert(0, str(_ROOT))
 
-SCRIPT_DIR = _ROOT / "tools"
+SCRIPT_DIR = _ROOT / "scripts"
 DATA_DIR = _ROOT / "data"
 RESULTS_DIR = _ROOT / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,7 +119,7 @@ RAG分数：[0到1之间的小数]
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=400,
-            timeout=60,
+            timeout=600,
         )
         content = (resp.choices[0].message.content or "").strip()
 
@@ -128,8 +127,12 @@ RAG分数：[0到1之间的小数]
         ag_reason, rag_reason = content, content
 
         m = re.search(r'Graph-Agent[分数打分：:]\s*([0-9.]+)', content)
+        if not m:
+            m = re.search(r'Graph-Agent分数[：:\s]+([0-9.]+)', content)
         if m: ag_score = float(m.group(1))
         m = re.search(r'RAG[分数打分：:]\s*([0-9.]+)', content)
+        if not m:
+            m = re.search(r'RAG分数[：:\s]+([0-9.]+)', content)
         if m: rag_score = float(m.group(1))
 
         return {
@@ -159,16 +162,24 @@ def run_llm_judge(agent_results: list, rag_results: list, output_path: Path, mod
     all_indices = sorted(set(ag_by_idx.keys()) & set(rg_by_idx.keys()))
     print(f"共 {len(all_indices)} 题需要 Judge")
 
+    def clean_str(s):
+        """Convert to string, handling NaN and None"""
+        if s is None:
+            return ""
+        if isinstance(s, float):  # NaN
+            return ""
+        return str(s)[:500]  # Truncate to avoid too long
+
     args_list = []
     for idx in all_indices:
         ag = ag_by_idx[idx]
         rg = rg_by_idx[idx]
         args_list.append((
             idx,
-            ag.get("具体问题", ""),
-            ag.get("参考答案", ""),
-            ag.get("生成答案", ""),
-            rg.get("生成答案", ""),
+            clean_str(ag.get("具体问题", "")),
+            clean_str(ag.get("参考答案", "")),
+            clean_str(ag.get("生成答案", "")),
+            clean_str(rg.get("生成答案", "")),
             judge_model,
         ))
 
@@ -208,7 +219,7 @@ def run_llm_judge(agent_results: list, rag_results: list, output_path: Path, mod
 def run_classic_rag(csv_path: Path, output_path: Path, limit: int = 0):
     """并行运行 Classic-RAG（直接调用模块内函数，不走子进程）"""
     import pandas as pd
-    from classic_rag import retrieve, generate_answer
+    from src.qa.classic_rag import retrieve, generate_answer
     from openai import OpenAI
 
     df = pd.read_csv(csv_path)
@@ -283,8 +294,8 @@ def run_classic_rag(csv_path: Path, output_path: Path, limit: int = 0):
 def run_graph_agent(csv_path: Path, output_path: Path, limit: int = 0):
     """并行运行 Graph-Agent"""
     import pandas as pd
-    from agent_qa import run_agent
-    from neo4j_writer import get_driver
+    from src.qa.agent import run_agent
+    from src.neo4j_writer import get_driver
 
     df = pd.read_csv(csv_path)
     if limit > 0:
@@ -399,15 +410,15 @@ def main():
     if not args.skip_agent:
         print("\n[3/4] 运行 Graph-Agent（等待 Neo4j 重建完成）...")
         # 检查 Neo4j 是否有数据
-        from neo4j_writer import get_driver
+        from src.neo4j_writer import get_driver
         driver = get_driver()
         with driver.session() as s:
             result = s.run("MATCH (f:Function) RETURN count(f) as cnt")
             cnt = result.single()["cnt"]
         driver.close()
         if cnt == 0:
-            print("  Neo4j 为空，跳过 Graph-Agent（需先运行 scripts/run_stage1_clangd.py）")
-            print("  请运行: python scripts/run_stage1_clangd.py")
+            print("  Neo4j 为空，跳过 Graph-Agent（需先运行 scripts/src/ingestion/orchestrator.py）")
+            print("  请运行: python scripts/src/ingestion/orchestrator.py")
             print("  然后重新运行: python experiments/parallel_runner.py --skip-rag")
         else:
             t0 = time.time()

@@ -1,5 +1,5 @@
 """
-阶段 3：通过 GitHub API 拉取仓库的 Issue 与 Pull Request，以及 PR 的变更文件列表。
+GitHub 数据拉取：通过 GitHub API 拉取仓库的 Issue 与 Pull Request，以及 PR 的变更文件列表。
 使用 .env 中的 GITHUB_TOKEN；需配置 GITHUB_REPO 或由 REPO_ROOT 的 git remote 推导。
 """
 from __future__ import annotations

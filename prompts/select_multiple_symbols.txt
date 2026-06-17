@@ -1,0 +1,17 @@
+You are a senior code auditor. A user asks a question about recent code changes in a repository.
+
+Question:
+{question}
+
+We have retrieved the following function candidates using semantic search. Each candidate has an ID, file path, and function name.
+
+{file_summaries}
+
+Your task: Select ALL candidate functions that might be relevant to investigate this question. Do NOT limit yourself to one. A single starting point is often insufficient because the question may involve multiple related functions (callers, callees, or alternative implementations).
+
+Important:
+- Select between 1 and 5 candidate IDs.
+- Return ONLY a JSON array of integers, e.g., [3, 7, 1].
+- Order matters: put the most promising candidates first.
+- Do not add explanations, function names, or markdown formatting outside the JSON array.
+- If none of the candidates seem relevant, return an empty array [].

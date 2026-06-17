@@ -1,0 +1,184 @@
+"""Tests for call_resolver.py (simplified: trust clangd, no param-count disambiguation)"""
+from __future__ import annotations
+
+from src.ingestion.call_resolver import (
+    build_function_lookup,
+    resolve_call,
+    resolve_all_calls,
+)
+from src.ingestion.models import FunctionSymbol, RawCall
+
+
+class TestBuildFunctionLookup:
+    def test_basic_indexing(self):
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+            FunctionSymbol(id="a.cpp:foo:30", name="foo", file_path="a.cpp", start_line=30, end_line=40),
+            FunctionSymbol(id="b.cpp:bar:5", name="bar", file_path="b.cpp", start_line=5, end_line=15),
+        ]
+        lookup = build_function_lookup(funcs)
+
+        assert lookup.by_location[("a.cpp", "foo", 10)] == "a.cpp:foo:10"
+        assert lookup.by_location[("a.cpp", "foo", 30)] == "a.cpp:foo:30"
+        assert len(lookup.by_name[("a.cpp", "foo")]) == 2
+        assert lookup.by_id["a.cpp:foo:10"].name == "foo"
+
+    def test_empty_list(self):
+        lookup = build_function_lookup([])
+        assert lookup.by_location == {}
+        assert lookup.by_name == {}
+
+
+class TestResolveCall:
+    def test_resolve_by_callee_line_exact(self):
+        """利用 callee_line 精确匹配重载函数。"""
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+            FunctionSymbol(id="a.cpp:foo:30", name="foo", file_path="a.cpp", start_line=30, end_line=40),
+        ]
+        lookup = build_function_lookup(funcs)
+
+        raw = RawCall(caller_index=0, callee_name="foo", file_path="a.cpp", line=5, callee_file_path="a.cpp", callee_line=35)
+        callee_id, status, candidates = resolve_call(lookup, raw, "b.cpp:main:1")
+        assert status == "resolved"
+        assert callee_id == "a.cpp:foo:30"
+        assert candidates is None
+
+    def test_resolve_by_unique_name(self):
+        """只有一个候选时，直接匹配。"""
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+        ]
+        lookup = build_function_lookup(funcs)
+
+        raw = RawCall(caller_index=0, callee_name="foo", file_path="a.cpp", line=5)
+        callee_id, status, candidates = resolve_call(lookup, raw, "b.cpp:main:1")
+        assert status == "resolved"
+        assert callee_id == "a.cpp:foo:10"
+
+    def test_ambiguous_multiple_candidates(self):
+        """多个候选且 callee_line 无法区分时，标记 AMBIGUOUS（不再消歧）。"""
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+            FunctionSymbol(id="a.cpp:foo:30", name="foo", file_path="a.cpp", start_line=30, end_line=40),
+        ]
+        lookup = build_function_lookup(funcs)
+
+        raw = RawCall(caller_index=0, callee_name="foo", file_path="a.cpp", line=5, callee_file_path="a.cpp", callee_line=None)
+        callee_id, status, candidates = resolve_call(lookup, raw, "b.cpp:main:1")
+        assert status == "ambiguous"
+        assert callee_id is None
+        assert len(candidates) == 2
+        assert "a.cpp:foo:10" in candidates
+        assert "a.cpp:foo:30" in candidates
+
+    def test_unresolved_no_candidates(self):
+        """无候选时标记 UNRESOLVED。"""
+        lookup = build_function_lookup([])
+
+        raw = RawCall(caller_index=0, callee_name="foo", file_path="a.cpp", line=5)
+        callee_id, status, candidates = resolve_call(lookup, raw, "b.cpp:main:1")
+        assert status == "unresolved"
+        assert callee_id is None
+        assert candidates is None
+
+    def test_cross_file_call(self):
+        """跨文件调用：使用 callee_file_path 查找。"""
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+            FunctionSymbol(id="b.cpp:bar:5", name="bar", file_path="b.cpp", start_line=5, end_line=15),
+        ]
+        lookup = build_function_lookup(funcs)
+
+        raw = RawCall(
+            caller_index=0, callee_name="bar", file_path="a.cpp", line=12,
+            callee_file_path="b.cpp", callee_line=8,
+        )
+        callee_id, status, candidates = resolve_call(lookup, raw, "a.cpp:foo:10")
+        assert status == "resolved"
+        assert callee_id == "b.cpp:bar:5"
+
+    def test_fallback_to_global_match(self):
+        """callee_file_path 中找不到时，fallback 到全局名称匹配。"""
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+        ]
+        lookup = build_function_lookup(funcs)
+
+        raw = RawCall(
+            caller_index=0, callee_name="foo", file_path="a.cpp", line=12,
+            callee_file_path="b.cpp", callee_line=None,
+        )
+        callee_id, status, candidates = resolve_call(lookup, raw, "a.cpp:main:1")
+        assert status == "global_match"
+        assert callee_id == "a.cpp:foo:10"
+
+    def test_no_param_count_disambiguation(self):
+        """不再使用参数个数消歧：多候选直接标记 ambiguous。"""
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20, param_count=0),
+            FunctionSymbol(id="a.cpp:foo:30", name="foo", file_path="a.cpp", start_line=30, end_line=40, param_count=2),
+        ]
+        lookup = build_function_lookup(funcs)
+
+        raw = RawCall(
+            caller_index=0, callee_name="foo", file_path="a.cpp", line=5,
+            callee_file_path="a.cpp", callee_line=None,
+            callee_detail="int (int, int)",
+        )
+        callee_id, status, candidates = resolve_call(lookup, raw, "b.cpp:main:1")
+        # 不再消歧，直接 ambiguous
+        assert status == "ambiguous"
+        assert callee_id is None
+        assert len(candidates) == 2
+
+
+class TestResolveAllCalls:
+    def test_batch_resolution(self):
+        funcs = [
+            FunctionSymbol(id="a.cpp:main:1", name="main", file_path="a.cpp", start_line=1, end_line=10),
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+            FunctionSymbol(id="a.cpp:foo:30", name="foo", file_path="a.cpp", start_line=30, end_line=40),
+            FunctionSymbol(id="a.cpp:bar:50", name="bar", file_path="a.cpp", start_line=50, end_line=60),
+        ]
+        raw_calls = [
+            RawCall(caller_index=0, callee_name="foo", file_path="a.cpp", line=5, callee_file_path="a.cpp", callee_line=35),
+            RawCall(caller_index=0, callee_name="bar", file_path="a.cpp", line=6, callee_file_path="a.cpp", callee_line=55),
+            RawCall(caller_index=1, callee_name="foo", file_path="a.cpp", line=15, callee_file_path="a.cpp", callee_line=35),
+            RawCall(caller_index=0, callee_name="baz", file_path="a.cpp", line=7),
+        ]
+
+        result = resolve_all_calls(funcs, raw_calls)
+
+        assert len(result.calls) == 3
+        assert ("a.cpp:main:1", "a.cpp:foo:30") in result.calls
+        assert ("a.cpp:main:1", "a.cpp:bar:50") in result.calls
+        assert ("a.cpp:foo:10", "a.cpp:foo:30") in result.calls
+
+        assert len(result.external_calls) == 1
+        assert result.external_calls[0] == ("a.cpp:main:1", "baz")
+        assert len(result.unresolved) == 0
+
+    def test_self_call_filtered(self):
+        """真正的自调用（caller_id == callee_id）应被过滤。"""
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+        ]
+        raw_calls = [
+            RawCall(caller_index=0, callee_name="foo", file_path="a.cpp", line=15, callee_file_path="a.cpp", callee_line=15),
+        ]
+        result = resolve_all_calls(funcs, raw_calls)
+        assert result.calls == []
+        assert result.unresolved == []
+
+    def test_invalid_caller_index(self):
+        funcs = [
+            FunctionSymbol(id="a.cpp:foo:10", name="foo", file_path="a.cpp", start_line=10, end_line=20),
+        ]
+        raw_calls = [
+            RawCall(caller_index=99, callee_name="bar", file_path="a.cpp", line=5),
+        ]
+        result = resolve_all_calls(funcs, raw_calls)
+        assert result.calls == []
+        assert result.ambiguous == []
+        assert result.unresolved == []

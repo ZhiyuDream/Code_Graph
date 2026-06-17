@@ -1,5 +1,5 @@
 """
-阶段 3：将 GitHub Issue 与 Pull Request 写入 Neo4j。
+GitHub 数据写入：将 Issue 与 Pull Request 写入 Neo4j。
 节点：Issue、PullRequest。边：FIXES（PullRequest -> Issue，当 PR body 含 fixes #n 时）。
 PR 的 changed_paths 存为节点属性，查询「该 PR 涉及哪些函数」时用 Function.file_path 与 changed_paths 匹配。
 """
