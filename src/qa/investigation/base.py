@@ -33,14 +33,14 @@ def load_prompt(name: str) -> str:
 
 
 class LLMClient:
-    """统一的 DeepSeek v4-pro 调用客户端。"""
+    """统一的 DeepSeek 调用客户端。"""
 
-    def __init__(self):
+    def __init__(self, model: str = "deepseek-v4-pro"):
         self.client = OpenAI(
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL or "https://api.deepseek.com/v1",
         )
-        self.model = "deepseek-v4-pro"
+        self.model = model
 
     def call(self, prompt: str, temperature: float = 0.2, max_tokens: int = 8000) -> str:
         try:
@@ -90,13 +90,13 @@ class InvestigationState:
 class BaseInvestigator:
     """调查器基类。"""
 
-    def __init__(self, max_steps: int = 10, repo_path: Optional[str] = None):
+    def __init__(self, max_steps: int = 10, repo_path: Optional[str] = None, model: str = "deepseek-v4-pro", extract_prompt_name: str = "extract_evidence"):
         self.max_steps = max_steps
         root = get_repo_root()
         self.repo_path = repo_path or (str(root) if root else None)
         self.repo_path_obj = Path(self.repo_path) if self.repo_path else None
-        self.llm = LLMClient()
-        self.extract_prompt = load_prompt("extract_evidence")
+        self.llm = LLMClient(model=model)
+        self.extract_prompt = load_prompt(extract_prompt_name)
         self.answer_prompt = load_prompt("generate_answer")
 
     def _normalize_file_path(self, file_path: str) -> str:
@@ -197,6 +197,9 @@ class BaseInvestigator:
             "new_hypothesis": result.get("new_hypothesis", ""),
             "suspicious_symbols": valid_symbols if valid_symbols else candidate_symbols[:10],
             "suspicious_files": result.get("suspicious_files", []),
+            "relevance_score": result.get("relevance_score", 5),
+            "importance": result.get("importance", "background"),
+            "explanation": result.get("explanation", ""),
             "raw": result,
         }
 
@@ -245,9 +248,9 @@ class BaseInvestigator:
         self.state.frontier_files.extend(new_files)
         return new_files
 
-    def generate_answer(self) -> str:
-        """基于调查过程生成答案。"""
-        evidence_log = "\n\n".join(
+    def _format_evidence_log(self) -> str:
+        """格式化证据日志为文本。"""
+        return "\n\n".join(
             f"=== {e['file_path']} ===\n"
             f"Key facts: {e.get('key_facts', [])}\n"
             f"Hypothesis: {e.get('new_hypothesis', '')}\n"
@@ -255,16 +258,36 @@ class BaseInvestigator:
             for e in self.state.evidence_log
         )
 
-        files_summary = "\n\n".join(
-            f"=== {fp} ===\n{content[:1500]}"
+    def _format_files_summary(self, max_chars: int = 1500) -> str:
+        """格式化文件内容摘要为文本。"""
+        return "\n\n".join(
+            f"=== {fp} ===\n{content[:max_chars]}"
             for fp, content in self.state.files_content.items()
         )
 
+    def count_tokens(self, text: str) -> int:
+        """估算文本 token 数。优先使用 tiktoken，否则用字符/4 估算。"""
+        try:
+            import tiktoken
+            enc = tiktoken.encoding_for_model("gpt-4")
+            return len(enc.encode(text))
+        except Exception:
+            return len(text) // 4
+
+    def build_answer_prompt(self, max_chars: int = 1500) -> tuple[str, int]:
+        """构建答案生成 prompt 并返回 token 数。"""
+        evidence_log = self._format_evidence_log()
+        files_summary = self._format_files_summary(max_chars)
         prompt = self.answer_prompt.format(
             question=self.state.question,
             evidence_log=evidence_log,
             files_summary=files_summary,
         )
+        return prompt, self.count_tokens(prompt)
+
+    def generate_answer(self) -> str:
+        """基于调查过程生成答案。"""
+        prompt, _ = self.build_answer_prompt()
         return self.llm.call(prompt)
 
     def run(self, question: str, entry_file: str) -> Dict:

@@ -5,100 +5,79 @@
 1. 旧格式（单文件）：--input results/v2.json
 2. 新格式（分离）：--result results/benchmark.json --benchmark datasets/bench.json --range easy|hard
 
+支持两种 judge provider：
+- openai (默认)
+- deepseek
+
 用法示例：
-    # Easy benchmark 评估
-    python evals/eval_v2.py --result results/benchmark_symbol_fastpath_20260607_131010.json \
-        --benchmark datasets/posthoc_audit_benchmark_v2.json --range easy \
-        -o results/easy_eval.json -w 20
+    # OpenAI judge
+    python evals/eval_v2.py --result results/qa.json --benchmark datasets/benchmark_hard.json \
+        --range all -o results/eval.json -w 20
 
-    # Hard benchmark 评估
-    python evals/eval_v2.py --result results/benchmark_hard_20260607_200601.json \
-        --benchmark datasets/benchmark_hard.json --range all \
-        -o results/hard_eval.json -w 20
-
-    # 旧格式单文件评估
-    python evals/eval_v2.py --input results/v2_deepseek_fullfiles.json \
-        -o results/v2_deepseek_fullfiles.eval.json -w 20
+    # DeepSeek judge
+    python evals/eval_v2.py --result results/qa.json --benchmark datasets/benchmark_hard.json \
+        --range all --provider deepseek -o results/eval_deepseek.json -w 10
 """
 import json
 import sys
 import os
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL
+from config import OPENAI_API_KEY, OPENAI_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL
 from openai import OpenAI
 
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gpt-4.1-mini")
 
-# ── Prompts ─────────────────────────────────────────────────────────
+def load_prompt(name: str) -> str:
+    """从 prompts/ 目录加载 prompt 模板。"""
+    path = _ROOT / "prompts" / f"{name}.txt"
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
-BINARY_JUDGE_PROMPT = """请判断「生成答案」是否正确回答了问题。
 
-判断标准：
-- 正确 (CORRECT): 生成答案准确回答了问题，核心信息正确，无重大错误
-- 错误 (INCORRECT): 生成答案与问题无关、信息错误、或未回答问题
+# 延迟初始化 client，支持 provider 选择
+_client = None
+_provider = "openai"
+_model = "gpt-4.1-mini"
 
-必须首行输出：结果: CORRECT 或 结果: INCORRECT
-第二行起：简要说明理由（1-2句话）
 
-【问题】
-{question}
+def init_client(provider: str, model: str | None = None):
+    """初始化 judge client。"""
+    global _client, _provider, _model
+    _provider = provider
 
-【参考答案】
-{reference}
+    if provider == "deepseek":
+        _client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL or None)
+        _model = model or "deepseek-v4-pro"
+    else:
+        _client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
+        _model = model or os.environ.get("JUDGE_MODEL", "gpt-4.1-mini")
 
-【生成答案】
-{generated}
-"""
 
-CITATION_JUDGE_PROMPT = """你是一位严格的代码审查评估专家。请评估 AI 生成答案是否覆盖了给定的 gold evidence 文件。
+def call_judge(prompt: str, json_mode: bool = False, max_tokens: int = 800) -> str:
+    """调用 judge LLM。"""
+    kwargs = {
+        "model": _model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    }
+    if json_mode and _provider == "openai":
+        kwargs["response_format"] = {"type": "json_object"}
 
-【评估规则】
-1. 只看 .cpp / .c 文件，忽略 .h / .hpp 头文件
-2. 如果 gold evidence 中多个条目指向同一文件的不同行号，只要答案引用了该文件（无论行号是否精确匹配），就算覆盖
-3. "引用"的定义：答案正文中明确提到该文件路径（如 `common/arg.cpp` 或 `common/arg.cpp:123`），且将其作为分析证据使用
-4. 如果答案只是顺带提到文件名但没有分析其内容，不算"引用"
-
-【原始问题】
-{question}
-
-【Gold Evidence（需要被覆盖的文件，已排除 .h/.hpp）】
-{gold_files}
-
-【参考答案】
-{reference_answer}
-
-【生成答案】
-{generated_answer}
-
----
-
-请判断生成答案的引用覆盖情况：
-
-1. 对于每个 gold 文件，判断是否被生成答案引用
-2. 计算覆盖率 = 被引用的 gold 文件数 / 总 gold 文件数
-3. 对于未被引用的文件，分析原因：
-   - "检索失败"：答案中完全没有提到该文件
-   - "搜到未引"：答案中提到了该文件但没有作为核心证据分析
-   - "不需要"：该文件对回答问题不是必需的
-
-返回 JSON：
-{{
-  "coverage_ratio": 0.0,
-  "cited_files": ["file1.cpp", "file2.cpp"],
-  "missing_files": ["file3.cpp"],
-  "missing_reasons": {{"file3.cpp": "检索失败|搜到未引|不需要"}},
-  "notes": "简短说明"
-}}
-"""
+    resp = _client.chat.completions.create(**kwargs)
+    return resp.choices[0].message.content.strip()
 
 
 # ── Core functions ──────────────────────────────────────────────────
+
+BINARY_JUDGE_PROMPT = load_prompt("binary_judge")
+CITATION_JUDGE_PROMPT = load_prompt("citation_judge")
+
 
 def llm_binary_judge(question: str, reference: str, generated: str) -> tuple[bool, str]:
     prompt = BINARY_JUDGE_PROMPT.format(
@@ -107,13 +86,7 @@ def llm_binary_judge(question: str, reference: str, generated: str) -> tuple[boo
         generated=generated[:1500]
     )
     try:
-        resp = client.chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=200
-        )
-        text = resp.choices[0].message.content.strip()
+        text = call_judge(prompt, json_mode=False, max_tokens=200)
         first_line = text.split('\n')[0].upper()
         is_correct = "CORRECT" in first_line and "INCORRECT" not in first_line
         return is_correct, text
@@ -139,14 +112,7 @@ def llm_citation_judge(question: str, reference: str, generated: str, gold_files
         generated_answer=generated,
     )
     try:
-        resp = client.chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=800,
-            response_format={"type": "json_object"},
-        )
-        text = resp.choices[0].message.content.strip()
+        text = call_judge(prompt, json_mode=True, max_tokens=800)
         result = json.loads(text)
         return {
             "coverage_ratio": float(result.get("coverage_ratio", 0)),
@@ -253,9 +219,15 @@ def main():
     parser.add_argument("--range", choices=["easy", "hard", "all"], default="easy")
     parser.add_argument("--mode", choices=["binary", "citation", "all"], default="all",
                         help="评估模式: binary=仅二元判断, citation=仅引用覆盖, all=两者")
+    parser.add_argument("--provider", choices=["openai", "deepseek"], default="openai",
+                        help="Judge LLM provider")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Judge model name (default: gpt-4.1-mini for openai, deepseek-v4-pro for deepseek)")
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("-w", "--workers", type=int, default=20)
     args = parser.parse_args()
+
+    init_client(args.provider, args.model)
 
     # Load data
     if args.input:
@@ -265,7 +237,7 @@ def main():
     else:
         parser.error("请提供 --input 或 (--result + --benchmark)")
 
-    print(f"加载 {len(items)} 题，模型: {JUDGE_MODEL}, workers: {args.workers}, mode: {args.mode}")
+    print(f"加载 {len(items)} 题，provider: {args.provider}, model: {_model}, workers: {args.workers}, mode: {args.mode}")
 
     # Run evaluation
     completed = 0

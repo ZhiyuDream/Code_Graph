@@ -11,10 +11,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
-
 from .base import BaseRetriever, RetrievalResult
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, EMBEDDING_MODEL
+from config import EMBEDDING_MODEL
+from src.core.embedding_client import get_encoder
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +40,10 @@ class EmbeddingRetriever(BaseRetriever):
         self.index_path = Path(index_path) if index_path else _DEFAULT_INDEX
         self.model = model
         self._index: dict | None = None
-        self._client: OpenAI | None = None
+        self._encoder = get_encoder(model=model)
 
-    def _get_client(self) -> OpenAI:
-        if self._client is None:
-            self._client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-        return self._client
+    def _get_encoder(self):
+        return self._encoder
 
     def _load_index(self) -> dict:
         if self._index is None:
@@ -70,7 +67,6 @@ class EmbeddingRetriever(BaseRetriever):
 
         from neo4j import GraphDatabase
         repo_root = Path(repo_root) if repo_root else Path(".")
-        client = self._get_client()
         chunks: list[dict] = []
 
         with driver.session(database=database) as s:
@@ -124,9 +120,8 @@ class EmbeddingRetriever(BaseRetriever):
         embeddings: list[list[float]] = []
         for i in range(0, len(texts), 64):
             batch = texts[i:i + 64]
-            resp = client.embeddings.create(model=self.model, input=batch)
-            for e in sorted(resp.data, key=lambda x: x.index):
-                embeddings.append(e.embedding)
+            batch_embs = self._encoder.encode(batch)
+            embeddings.extend(batch_embs.tolist())
             logger.info("  embedded %d/%d", min(i + 64, len(texts)), len(texts))
 
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,11 +142,9 @@ class EmbeddingRetriever(BaseRetriever):
             return []
 
         index = self._load_index()
-        client = self._get_client()
 
         try:
-            resp = client.embeddings.create(model=self.model, input=[question])
-            query_emb = resp.data[0].embedding
+            query_emb = self._encoder.encode_single(question).tolist()
         except Exception as e:
             logger.warning("Embedding API error: %s", e)
             return []

@@ -1,0 +1,43 @@
+你是代码审计专家。你的任务是主动寻找可能推翻当前解释的反例。
+
+【原始问题】
+{question}
+
+【当前主要解释】
+{leading_hypothesis}
+
+【已扫描文件摘要】
+{file_summaries}
+
+【已访问目录】
+{visited_dirs}
+
+【尚未访问的候选目录】
+{unvisited_dirs}
+
+---
+
+请从以下角度挑战当前解释：
+
+1. **MISSING_EVIDENCE**: 当前解释还依赖哪些未被验证的假设？需要哪些额外证据？
+
+2. **ALTERNATIVE_PATHS**: 是否存在其他实现路径、调用入口或配置位置也能产生相同行为？
+
+3. **INVALIDATING_FILES**: 哪些尚未访问的文件或目录如果内容不同，会推翻当前解释？
+
+4. **SUGGESTED_REGIONS**: 基于以上分析，建议优先检查哪个未访问目录？
+
+---
+
+【输出格式】
+MISSING_EVIDENCE:
+...
+
+ALTERNATIVE_PATHS:
+...
+
+INVALIDATING_FILES:
+...
+
+SUGGESTED_REGIONS:
+...

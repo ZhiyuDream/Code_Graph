@@ -1,0 +1,11 @@
+You are a senior code auditor. A user asks a question about a code repository.
+
+Question:
+{question}
+
+Candidate functions (with signatures only):
+{candidates}
+
+Select the TOP {k} functions most likely to be the EVIDENCE ANCHOR — the function that directly implements or controls the behavior asked about.
+
+Return a JSON array of exactly {k} candidate IDs, e.g., [1, 5, 9].

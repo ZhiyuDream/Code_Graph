@@ -1,0 +1,12 @@
+You are a senior code auditor. A user asks a question about a code repository.
+
+Question:
+{question}
+
+Candidate functions were selected. Here are their full code:
+
+{candidates_with_code}
+
+Choose the ONE function that is the EVIDENCE ANCHOR — the function that directly implements or controls the behavior asked about, and contains the key evidence to answer the question.
+
+Return ONLY the function name, e.g., "function_name".

@@ -2,97 +2,35 @@
 """
 Retrieval vs Selection Decomposition.
 
-For each question:
-1. Two-stage retrieval: 20 files x 5 functions = ~100 candidates
-2. Check if gold symbol is in candidate pool (Pool Recall)
-3. Ask LLM to select ONE candidate (Single Selection Recall)
-4. Ask LLM to select MULTIPLE candidates (Multi Selection Recall)
-5. Oracle: force-select gold symbol and expand (Oracle Selection Coverage)
-
-This separates retrieval error from selection error.
+Separates retrieval error from selection error:
+  1. Pool Recall: gold symbol in candidate pool
+  2. Single Selection Recall
+  3. Multi Selection Recall
+  4. Oracle Expansion Coverage
 """
 import json
-import math
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import numpy as np
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from config import get_repo_root, OPENAI_API_KEY, OPENAI_BASE_URL, EMBEDDING_MODEL
+from config import get_repo_root
+from src.qa.candidate_pool import build_function_pool
 from src.qa.investigation.base import BaseInvestigator, LLMClient, load_prompt
+from src.qa.retrievers.fast_embedding import FastEmbeddingRetriever
 from src.search.code_reader import read_full_file
 from src.search.grep_search_v2 import grep_files
-
-
-def cosine_sim_matrix(query_embs: np.ndarray, doc_embs: np.ndarray) -> np.ndarray:
-    qn = np.linalg.norm(query_embs, axis=1, keepdims=True)
-    dn = np.linalg.norm(doc_embs, axis=1, keepdims=True)
-    qn[qn == 0] = 1e-10
-    dn[dn == 0] = 1e-10
-    return (query_embs @ doc_embs.T) / (qn @ dn.T)
-
-
-class FastEmbeddingRetriever:
-    def __init__(self, index_path: Path | None = None):
-        if index_path is None:
-            index_path = Path(__file__).resolve().parent.parent / "data" / "qa_embedding_index.json"
-        self.index_path = index_path
-        self.chunks = []
-        self.doc_matrix = None
-        self.file_to_chunks: dict[str, list[int]] = {}
-        self._load()
-
-    def _load(self):
-        with open(self.index_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.chunks = data["chunks"]
-        embs = np.asarray(data["embeddings"], dtype=np.float32)
-        self.doc_matrix = embs
-        for idx, ch in enumerate(self.chunks):
-            fp = ch.get("meta", {}).get("file_path", "")
-            self.file_to_chunks.setdefault(fp, []).append(idx)
-
-    def encode_queries(self, queries: list[str]) -> np.ndarray:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=queries)
-        embs = [None] * len(queries)
-        for e in resp.data:
-            embs[e.index] = e.embedding
-        return np.asarray(embs, dtype=np.float32)
-
-    def retrieve(self, query_emb: np.ndarray, top_k: int = 5, file_filter: set[str] | None = None) -> list[dict]:
-        if file_filter is not None:
-            indices = []
-            for fp in file_filter:
-                indices.extend(self.file_to_chunks.get(fp, []))
-            sub_matrix = self.doc_matrix[indices]
-            sims = cosine_sim_matrix(query_emb.reshape(1, -1), sub_matrix)[0]
-            pairs = [(sims[i], indices[i]) for i in range(len(indices))]
-        else:
-            sims = cosine_sim_matrix(query_emb.reshape(1, -1), self.doc_matrix)[0]
-            pairs = [(sims[i], i) for i in range(len(self.chunks))]
-        pairs.sort(key=lambda x: -x[0])
-        results = []
-        for sim, idx in pairs[:top_k]:
-            ch = self.chunks[idx]
-            results.append({
-                "score": round(float(sim), 4),
-                "metadata": ch.get("meta", {}),
-            })
-        return results
 
 
 def normalize_path(path: str) -> str:
     repo_root = str(get_repo_root())
     if path.startswith(repo_root):
         path = path[len(repo_root):].lstrip('/')
-    return path.lstrip('./')
+    return path.lstrip('./').lstrip('/')
 
 
 def file_priority(path: str) -> int:
@@ -122,7 +60,6 @@ def select_definition_file(files: list[str]) -> str | None:
 
 def expand_from_function(entry_function: str, repo_path: str,
                          callees_top_k: int, files_per_symbol: int) -> set[str]:
-    from collections import Counter
     all_occurrences = grep_files(entry_function, repo_path, limit=100)
     visited = {normalize_path(f) for f in all_occurrences}
     definition_file = select_definition_file(list(visited))
@@ -167,34 +104,6 @@ def load_items(bench_path: Path, range_str: str) -> list[dict]:
     return selected
 
 
-def two_stage_retrieve(query_emb: np.ndarray, retriever: FastEmbeddingRetriever,
-                       top_k_files: int, top_m_functions: int) -> list[dict]:
-    file_results = retriever.retrieve(query_emb, top_k=top_k_files * 3)
-    file_scores = {}
-    for r in file_results:
-        fp = normalize_path(r["metadata"].get("file_path", ""))
-        if fp:
-            file_scores[fp] = max(file_scores.get(fp, 0), r["score"])
-    top_files = sorted(file_scores.items(), key=lambda x: -x[1])[:top_k_files]
-
-    all_functions = []
-    seen = set()
-    for fp, _ in top_files:
-        func_results = retriever.retrieve(query_emb, top_k=top_m_functions, file_filter={fp})
-        for r in func_results:
-            name = r["metadata"].get("name", "")
-            key = (fp, name)
-            if name and key not in seen:
-                seen.add(key)
-                all_functions.append({
-                    "file_path": fp,
-                    "name": name,
-                    "score": r["score"],
-                })
-    all_functions.sort(key=lambda x: -x["score"])
-    return all_functions
-
-
 def llm_select_single(question: str, candidates: list[dict], llm: LLMClient) -> dict:
     prompt_template = load_prompt("stage1_select_function")
     summaries = []
@@ -213,14 +122,9 @@ def llm_select_single(question: str, candidates: list[dict], llm: LLMClient) -> 
             all_ids.append(idx)
 
     seen = set()
-    unique_ids = []
     for idx in all_ids:
         if idx not in seen:
-            unique_ids.append(idx)
-            seen.add(idx)
-
-    if unique_ids:
-        return candidates[unique_ids[0] - 1]
+            return candidates[idx - 1]
     return candidates[0]
 
 
@@ -261,12 +165,11 @@ def llm_select_multiple(question: str, candidates: list[dict], llm: LLMClient) -
     return [candidates[i-1] for i in valid[:5]]
 
 
-def run_item(item: dict, oracle_item: dict, query_emb: np.ndarray,
+def run_item(item: dict, oracle_item: dict, query_emb,
              retriever: FastEmbeddingRetriever,
              llm: LLMClient, repo_path: str,
-             top_k_files: int, top_m_functions: int,
              top_n: int, files_per_symbol: int) -> dict:
-    candidates = two_stage_retrieve(query_emb, retriever, top_k_files, top_m_functions)
+    candidates = build_function_pool(query_emb, retriever)
     candidate_names = {c["name"] for c in candidates}
 
     gold_symbols = set(oracle_item.get("gold_symbols", []))
@@ -275,16 +178,13 @@ def run_item(item: dict, oracle_item: dict, query_emb: np.ndarray,
     pool_recall = bool(gold_symbols & candidate_names)
     best_in_pool = best_symbol in candidate_names if best_symbol else False
 
-    # LLM single selection
     single_selected = llm_select_single(item["question"], candidates, llm)
     single_hit = single_selected["name"] in gold_symbols
 
-    # LLM multi selection
     multi_selected = llm_select_multiple(item["question"], candidates, llm)
     multi_names = {c["name"] for c in multi_selected}
     multi_hit = bool(gold_symbols & multi_names)
 
-    # Oracle: expand from best symbol if in pool
     oracle_coverage = 0.0
     if best_symbol and best_symbol in candidate_names:
         visited = expand_from_function(best_symbol, repo_path, top_n, files_per_symbol)
@@ -300,8 +200,10 @@ def run_item(item: dict, oracle_item: dict, query_emb: np.ndarray,
         "pool_recall": pool_recall,
         "best_in_pool": best_in_pool,
         "single_selected": single_selected["name"],
+        "single_selected_file": single_selected.get("file_path", ""),
         "single_hit": single_hit,
         "multi_selected": sorted(multi_names),
+        "multi_selected_files": {c["name"]: c.get("file_path", "") for c in multi_selected},
         "multi_hit": multi_hit,
         "oracle_coverage": oracle_coverage,
     }
@@ -322,9 +224,24 @@ def main():
     args = parser.parse_args()
 
     items = load_items(args.benchmark, args.range)
-    with open(args.oracle, "r", encoding="utf-8") as f:
-        oracle = json.load(f)
-    oracle_by_qa = {r["qa_id"]: r for r in oracle["per_item"]}
+
+    oracle_by_qa = {}
+    if args.oracle.exists():
+        with open(args.oracle, "r", encoding="utf-8") as f:
+            oracle = json.load(f)
+        oracle_by_qa = {r["qa_id"]: r for r in oracle["per_item"]}
+
+    with open(args.benchmark, "r", encoding="utf-8") as f:
+        bench = json.load(f)
+    for it in bench.get("items", []):
+        qa_id = it.get("qa_id")
+        if qa_id not in oracle_by_qa:
+            gold_syms = sorted(set(ev.get("symbol", "") for ev in it.get("gold_evidence", []) if ev.get("symbol")))
+            oracle_by_qa[qa_id] = {
+                "qa_id": qa_id,
+                "gold_symbols": gold_syms,
+                "best_symbol": gold_syms[0] if gold_syms else None,
+            }
 
     retriever = FastEmbeddingRetriever()
     query_embs = retriever.encode_queries([item["question"] for item in items])
@@ -337,7 +254,7 @@ def main():
         futures = {
             executor.submit(run_item, item, oracle_by_qa[item["qa_id"]],
                             query_embs[i], retriever,
-                            llm, repo_path, args.top_k_files, args.top_m_functions,
+                            llm, repo_path,
                             args.top_n, args.files_per_symbol): item
             for i, item in enumerate(items)
         }
@@ -362,7 +279,7 @@ def main():
     print(f"Retrieval vs Selection Decomposition ({args.top_k_files} files × {args.top_m_functions} funcs)")
     print(f"{'='*60}")
     print(f"总题数: {total}")
-    print(f"Pool Recall (gold symbol in 100 candidates): {pool_rate*100:.1f}%")
+    print(f"Pool Recall: {pool_rate*100:.1f}%")
     print(f"LLM Single Selection Recall: {single_rate*100:.1f}%")
     print(f"LLM Multi Selection Recall: {multi_rate*100:.1f}%")
     print(f"Oracle Selection Avg Coverage: {oracle_avg_cov*100:.1f}%")
