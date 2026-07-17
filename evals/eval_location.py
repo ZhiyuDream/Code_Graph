@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL
-from openai import OpenAI
+from config import LLM_MODEL
+from src.core.llm_client import call_llm
 
 LOCATION_JUDGE_PROMPT = """你是一个代码审查质量评审。请判断「生成答案」是否**合理地**引用了关键证据中的代码位置。
 
@@ -50,9 +50,6 @@ LOCATION_JUDGE_PROMPT = """你是一个代码审查质量评审。请判断「�
 第二行起：简要说明理由（1-2句话，指出具体哪些路径匹配了，哪些没匹配）
 """
 
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-
-
 def location_judge(item: dict) -> tuple[bool, str, int]:
     """评估答案是否准确指出文件位置。"""
     # 提取证据中的文件路径
@@ -75,13 +72,11 @@ def location_judge(item: dict) -> tuple[bool, str, int]:
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
+        text = call_llm(
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=200
+            model=LLM_MODEL,
+            max_tokens=200,
         )
-        text = resp.choices[0].message.content.strip()
         first_line = text.split('\n')[0].upper()
         is_correct = "CORRECT" in first_line and "INCORRECT" not in first_line
         return is_correct, text, item.get("index", 0)

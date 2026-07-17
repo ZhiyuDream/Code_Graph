@@ -80,13 +80,26 @@ cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..
 
 ### 2.1 代码摄取（clangd → Neo4j）
 
+推荐并行版本（快很多）：
+
+```bash
+python scripts/ingestion/ingest_parallel.py --workers 8
+```
+
+- 默认自动选择 worker 数（最多 8，不超过 CPU 核心数，每 worker 至少 10 个文件）。
+- 每个 worker 独立启动一个 clangd 实例，分片解析文件。
+- 临时缓存目录放在 `/data/users/zzy/.tmp/`（遵守 AGENTS.md）。
+- 日志写入 `logs/ingestion_parallel_YYYYMMDD_HHMMSS.log`。
+
+如果不需要并行或调试问题，也可以用串行版本：
+
 ```bash
 python scripts/ingestion/ingest_code.py
 ```
 
 - 依赖 `REPO_ROOT` 和 `COMPILE_COMMANDS_DIR`。
 - 依赖 **clangd 20+**；clangd 14–19 会产生空 `CALLS` 边。
-- 日志默认写到 `/tmp/ingestion_a6cc43c_v5.log`（当前实现）。若系统盘 `/tmp` 紧张，可临时设置 `TMPDIR=/data/users/zzy/.tmp`，但源码此处是硬编码路径，后续建议改为项目 `logs/` 目录。
+- 日志写入 `logs/ingestion_YYYYMMDD_HHMMSS.log`。
 
 ### 2.2 构建 Module Abstraction
 
@@ -176,31 +189,30 @@ python scripts/ingestion/build_embedding_index.py
 ```bash
 python scripts/qa/run_module_symbol_qa.py \
     --mode module_top5_symbol \
-    --provider deepseek \
-    --model deepseek-v4-pro \
+    --model glm-5.2 \
     --workers 15 \
-    --output results/qa_module_top5_symbol_deepseek.json
+    --output results/qa_module_top5_symbol_glm52.json
 ```
 
 可选 `--mode`：`baseline`、`module_top5_symbol`、`module_top10_symbol`。
+
+`--model` 留空则默认使用 `.env` 中的 `LLM_MODEL`；若 `LLM_MODEL` 也未设置，回退到 `deepseek-v4-pro`。
 
 默认输出：`results/qa_{mode}_{model}.json`。
 
 #### Concept-Symbol 方法
 
 ```bash
+# 默认使用 LLM_MODEL（单个模型）
 python scripts/qa/run_concept_symbol_qa.py
+
+# 指定模型，可多次指定跑多个模型
+python scripts/qa/run_concept_symbol_qa.py \
+    --model glm-5.2 \
+    --model deepseek-v4-pro
 ```
 
-该脚本会依次运行：
-
-- `concept_symbol_deepseek`（模型 `deepseek-v4-pro`）
-- `concept_symbol_deepseek_flash`（模型 `deepseek-v4-flash`）
-
-输出：
-
-- `results/qa_concept_symbol_deepseek.json`
-- `results/qa_concept_symbol_deepseek_flash.json`
+输出：`results/qa_concept_symbol_{model}.json`。
 
 > 若输出文件已存在，脚本会跳过。需要重跑时请手动删除对应文件。
 
@@ -208,20 +220,15 @@ python scripts/qa/run_concept_symbol_qa.py
 
 ```bash
 python evals/eval_v2.py \
-    --result results/qa_concept_symbol_deepseek.json \
+    --result results/qa_concept_symbol_glm-5.2.json \
     --benchmark datasets/benchmark_hard.json \
     --range all \
-    --provider openai \
-    --model gpt-4.1-mini \
-    -o results/eval_concept_symbol_deepseek.json \
+    --model glm-5.2 \
+    -o results/eval_concept_symbol_glm52.json \
     -w 20
 ```
 
-参数说明：
-
-- `--range`：`easy` / `hard` / `all`。`benchmark_hard.json` 共 100 题，前 50 为 easy，后 50 为 hard。
-- `--provider` / `--model`：Judge LLM。默认 `openai` + `gpt-4.1-mini`。
-- `--mode`：`binary` / `citation` / `all`。默认 `all`。
+`--model` 留空则默认使用 `LLM_MODEL` 环境变量，否则回退到 `gpt-4.1-mini`。
 
 ---
 
@@ -300,19 +307,27 @@ def _get_client(cfg: ModelConfig) -> OpenAI:
 
 3. 业务代码保持 `call_llm(..., model="qwen2.5-coder-32b")` 不变。
 
-### 4.4 重要例外：QA 脚本直接构造 OpenAI client
+### 4.4 重要例外（已修复）
 
-当前有两个脚本**没有走 `call_llm()`**，而是自己根据 `--provider` 构造 `OpenAI(...)`：
+~~当前有两个脚本没有走 `call_llm()`，而是自己根据 `--provider` 构造 `OpenAI(...)`：~~
 
-- `scripts/qa/run_module_symbol_qa.py`
-- `scripts/qa/run_concept_symbol_qa.py`
+`scripts/qa/run_module_symbol_qa.py` 和 `scripts/qa/run_concept_symbol_qa.py` 已改造为统一走 `call_llm()`，通过 `--model` 指定任意模型即可，`ModelRegistry` 会自动解析 provider / api_key / base_url。
 
-它们只支持 `openai` 和 `deepseek` 两个 provider。若要用本地模型生成答案，需要：
+### 4.5 现在只需要 `--model`
 
-1. 修改脚本里 `client = OpenAI(...)` 的逻辑，或
-2. 在本地启动一个 OpenAI 兼容代理，并把 `--provider openai` 的 `OPENAI_BASE_URL` 指向它。
+生成答案：
 
-推荐做法是把这两个脚本也改写成调用 `src.core.llm_client.call_llm()`，从而统一走 `ModelRegistry`。
+```bash
+python scripts/qa/run_module_symbol_qa.py --model glm-5.2 --workers 15
+```
+
+评估：
+
+```bash
+python evals/eval_v2.py --result results/qa_xxx.json --model glm-5.2 -o results/eval_xxx.json
+```
+
+不再需要 `--provider openai` / `--provider deepseek` 这种硬编码分支。
 
 ---
 
@@ -410,7 +425,7 @@ EMBEDDING_MODEL=bge-m3
 1. **`env.example.yml` 不是 `.env` 模板**。它是 conda 环境说明，已造成过误解。请使用 `.env.example`。
 2. **无独立 embedding 索引构建脚本**。目前需要临时脚本或复用归档脚本，建议后续补充 `scripts/ingestion/build_embedding_index.py`。
 3. **`ingest_code.py` 日志写 `/tmp/`**。违反项目 `AGENTS.md` 的磁盘规则；大仓库摄取时若 `/tmp` 满会失败。
-4. **QA 脚本绕过 `ModelRegistry`**。`run_module_symbol_qa.py` 和 `run_concept_symbol_qa.py` 直接构造 `OpenAI()`，换模型时容易遗漏。
+4. ~~QA 脚本绕过 `ModelRegistry`~~。已改造完成，`run_module_symbol_qa.py` 和 `run_concept_symbol_qa.py` 现在统一走 `call_llm()`。
 5. **Concept QA 脚本会跳过已存在输出**。重跑前检查 `results/qa_concept_symbol_*.json` 是否存在。
 
 ---
@@ -418,22 +433,23 @@ EMBEDDING_MODEL=bge-m3
 ## 7. 常用命令速查
 
 ```bash
-# 全量重建
-python scripts/ingestion/ingest_code.py
+# 全量重建（推荐并行建图）
+python scripts/ingestion/ingest_parallel.py --workers 8
 python scripts/ingestion/build_module_abstraction.py
 python scripts/ingestion/build_concept_abstraction.py
 python scripts/ingestion/build_embedding_index.py   # 需自行创建
 
 # QA
-python scripts/qa/run_module_symbol_qa.py --mode module_top5_symbol --provider deepseek --model deepseek-v4-pro --workers 15
-python scripts/qa/run_concept_symbol_qa.py
+python scripts/qa/run_module_symbol_qa.py --model glm-5.2 --workers 15
+python scripts/qa/run_concept_symbol_qa.py --model glm-5.2 --workers 10
 
 # Eval
 python evals/eval_v2.py \
-    --result results/qa_concept_symbol_deepseek.json \
+    --result results/qa_concept_symbol_glm-5.2.json \
     --benchmark datasets/benchmark_hard.json \
     --range all \
-    -o results/eval_concept_symbol_deepseek.json \
+    --model gpt-4.1-mini \
+    -o results/eval_concept_symbol_glm52_by_gpt41mini.json \
     -w 20
 ```
 

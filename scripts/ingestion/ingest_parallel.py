@@ -19,9 +19,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -40,10 +42,19 @@ logger = logging.getLogger("ingest_parallel")
 
 
 def setup_logging() -> None:
+    log_dir = _CODE_GRAPH / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"ingestion_parallel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+    ]
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
     )
+    print(f"Logging to: {log_path}")
 
 
 def _worker_init(cache_dir: str) -> None:
@@ -145,9 +156,11 @@ def main() -> int:
     chunks = [c for c in chunks if c]
     n_workers = len(chunks)
 
-    # 为每个 worker 创建独立缓存目录
+# 为每个 worker 创建独立缓存目录（放到数据盘临时目录，避免占用系统 /tmp）
+    tmp_base = Path("/data/users/zzy/.tmp")
+    tmp_base.mkdir(parents=True, exist_ok=True)
     cache_dirs = [
-        tempfile.mkdtemp(prefix=f"clangd_cache_w{i}_")
+        tempfile.mkdtemp(prefix=f"clangd_cache_w{i}_", dir=str(tmp_base))
         for i in range(n_workers)
     ]
 
@@ -171,7 +184,6 @@ def main() -> int:
         # 清理缓存目录
         for d in cache_dirs:
             try:
-                import shutil
                 shutil.rmtree(d, ignore_errors=True)
             except Exception:
                 pass

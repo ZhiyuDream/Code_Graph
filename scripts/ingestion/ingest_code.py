@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # scripts/ingestion/ingest_code.py -> parent.parent = scripts/ -> parent.parent.parent = Code_Graph/
@@ -32,15 +33,19 @@ from src.ingestion.orchestrator import run_full_pipeline
 
 
 def setup_logging() -> None:
+    log_dir = _CODE_GRAPH / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"ingestion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     handlers = [
         logging.StreamHandler(),
-        logging.FileHandler("/tmp/ingestion_a6cc43c_v5.log", mode="w", encoding="utf-8"),
+        logging.FileHandler(log_path, mode="w", encoding="utf-8"),
     ]
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=handlers,
     )
+    print(f"Logging to: {log_path}")
 
 
 def main() -> int:

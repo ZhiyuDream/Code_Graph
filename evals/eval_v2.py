@@ -5,18 +5,16 @@
 1. 旧格式（单文件）：--input results/v2.json
 2. 新格式（分离）：--result results/benchmark.json --benchmark datasets/bench.json --range easy|hard
 
-支持两种 judge provider：
-- openai (默认)
-- deepseek
+Judge LLM 通过 --model 指定，统一走 src/core/llm_client.py，默认 gpt-4.1-mini。
 
 用法示例：
-    # OpenAI judge
+    # 默认 judge：gpt-4.1-mini
     python evals/eval_v2.py --result results/qa.json --benchmark datasets/benchmark_hard.json \
         --range all -o results/eval.json -w 20
 
-    # DeepSeek judge
+    # 指定 glm-5.2 作为 judge（.env 中 OPENAI_BASE_URL 需指向兼容中转站）
     python evals/eval_v2.py --result results/qa.json --benchmark datasets/benchmark_hard.json \
-        --range all --provider deepseek -o results/eval_deepseek.json -w 10
+        --range all --model glm-5.2 -o results/eval_glm52.json -w 20
 """
 import json
 import sys
@@ -28,8 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL
-from openai import OpenAI
+from src.core.llm_client import call_llm, call_llm_json
 
 
 def load_prompt(name: str) -> str:
@@ -39,38 +36,32 @@ def load_prompt(name: str) -> str:
         return f.read()
 
 
-# 延迟初始化 client，支持 provider 选择
-_client = None
-_provider = "openai"
-_model = "gpt-4.1-mini"
+# 当前使用的 judge 模型，由命令行 --model 指定；默认从环境 LLM_MODEL 读取，未设置则回退 gpt-4.1-mini。
+_judge_model: str | None = None
 
 
-def init_client(provider: str, model: str | None = None):
-    """初始化 judge client。"""
-    global _client, _provider, _model
-    _provider = provider
-
-    if provider == "deepseek":
-        _client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL or None)
-        _model = model or "deepseek-v4-pro"
-    else:
-        _client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-        _model = model or os.environ.get("JUDGE_MODEL", "gpt-4.1-mini")
+def init_judge(model: str | None = None):
+    """初始化 judge 模型名称。"""
+    global _judge_model
+    _judge_model = model
 
 
 def call_judge(prompt: str, json_mode: bool = False, max_tokens: int = 800) -> str:
-    """调用 judge LLM。"""
-    kwargs = {
-        "model": _model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-    }
-    if json_mode and _provider == "openai":
-        kwargs["response_format"] = {"type": "json_object"}
-
-    resp = _client.chat.completions.create(**kwargs)
-    return resp.choices[0].message.content.strip()
+    """调用 judge LLM，统一走 call_llm / call_llm_json。"""
+    if json_mode:
+        result = call_llm_json(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            model=_judge_model,
+        )
+        if result is None:
+            return "{}"
+        return json.dumps(result, ensure_ascii=False)
+    return call_llm(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        model=_judge_model,
+    )
 
 
 # ── Core functions ──────────────────────────────────────────────────
@@ -219,15 +210,14 @@ def main():
     parser.add_argument("--range", choices=["easy", "hard", "all"], default="easy")
     parser.add_argument("--mode", choices=["binary", "citation", "all"], default="all",
                         help="评估模式: binary=仅二元判断, citation=仅引用覆盖, all=两者")
-    parser.add_argument("--provider", choices=["openai", "deepseek"], default="openai",
-                        help="Judge LLM provider")
     parser.add_argument("--model", type=str, default=None,
-                        help="Judge model name (default: gpt-4.1-mini for openai, deepseek-v4-pro for deepseek)")
+                        help="Judge model name (默认: 优先 LLM_MODEL 环境变量，否则 gpt-4.1-mini)")
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("-w", "--workers", type=int, default=20)
     args = parser.parse_args()
 
-    init_client(args.provider, args.model)
+    judge_model = args.model or os.environ.get("LLM_MODEL") or "gpt-4.1-mini"
+    init_judge(judge_model)
 
     # Load data
     if args.input:
@@ -237,7 +227,7 @@ def main():
     else:
         parser.error("请提供 --input 或 (--result + --benchmark)")
 
-    print(f"加载 {len(items)} 题，provider: {args.provider}, model: {_model}, workers: {args.workers}, mode: {args.mode}")
+    print(f"加载 {len(items)} 题，judge model: {_judge_model}, workers: {args.workers}, mode: {args.mode}")
 
     # Run evaluation
     completed = 0

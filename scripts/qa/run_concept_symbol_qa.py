@@ -25,9 +25,11 @@ Generate answer with LLM
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -35,9 +37,8 @@ import numpy as np
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, REPO_ROOT
-from openai import OpenAI
-
+from config import LLM_MODEL, REPO_ROOT
+from src.core.llm_client import call_llm
 from src.core.concept_abstraction import ConceptAbstraction
 from src.core.module_abstraction import ModuleAbstraction
 from src.qa.prompts import PromptBuilder
@@ -179,42 +180,83 @@ def baseline_retrieve(
             for r in results]
 
 
-def generate_answer(question: str, context: str, client: OpenAI, model: str = "gpt-4.1-mini") -> str:
+def generate_answer(question: str, context: str, model: str = "gpt-4.1-mini") -> str:
+    """调用 LLM 生成答案（统一走 call_llm）。"""
     prompt = PromptBuilder.answer_generation(question, context)
-    resp = client.chat.completions.create(
-        model=model,
+    return call_llm(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
         max_tokens=4000,
+        model=model,
     )
-    return resp.choices[0].message.content.strip()
 
 
-def run_qa(mode: str, items, q_embs, ca, retriever, chunks_by_id, repo_root, client, model="gpt-4.1-mini"):
+def process_one(mode, item, q_emb, ca, retriever, chunks_by_id, repo_root, model):
+    """处理单个问题。"""
+    if mode == "concept_symbol":
+        fids = concept_symbol_retrieve(item["question"], q_emb, ca, retriever, chunks_by_id)
+    else:
+        fids = baseline_retrieve(item["question"], q_emb, retriever)
+
+    context = build_context(fids, chunks_by_id, repo_root)
+    answer = generate_answer(item["question"], context, model)
+
+    return {
+        "qa_id": item["qa_id"],
+        "question": item["question"],
+        "answer": answer,
+        "retrieved_functions": fids,
+        "model": model,
+    }
+
+
+def run_qa(mode, items, q_embs, ca, retriever, chunks_by_id, repo_root, model="gpt-4.1-mini", workers=10):
     results = []
-    for idx, (item, q_emb) in enumerate(zip(items, q_embs), 1):
-        print(f"[{idx}/{len(items)}] {mode}: {item['qa_id']} (model={model})", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                process_one, mode, item, q_emb, ca, retriever, chunks_by_id, repo_root, model
+            ): idx
+            for idx, (item, q_emb) in enumerate(zip(items, q_embs))
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                result = future.result()
+                results.append(result)
+                print(f"[{len(results)}/{len(items)}] {mode}: {result['qa_id']} (model={model})", flush=True)
+            except Exception as e:
+                print(f"[ERROR] {mode} idx={idx}: {e}", flush=True)
 
-        if mode == "concept_symbol":
-            fids = concept_symbol_retrieve(item["question"], q_emb, ca, retriever, chunks_by_id)
-        else:
-            fids = baseline_retrieve(item["question"], q_emb, retriever)
-
-        context = build_context(fids, chunks_by_id, repo_root)
-        answer = generate_answer(item["question"], context, client, model)
-
-        results.append({
-            "qa_id": item["qa_id"],
-            "question": item["question"],
-            "answer": answer,
-            "retrieved_functions": fids,
-            "model": model,
-        })
-
+    # 按原始顺序排序
+    qa_id_to_idx = {item["qa_id"]: i for i, item in enumerate(items)}
+    results.sort(key=lambda r: qa_id_to_idx.get(r["qa_id"], 0))
     return results
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run Concept-Symbol end-to-end QA")
+    parser.add_argument(
+        "--model",
+        action="append",
+        default=None,
+        help="Answer generation model，可多次指定。默认使用 LLM_MODEL 环境变量，否则 deepseek-v4-pro",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["concept_symbol", "baseline"],
+        default="concept_symbol",
+        help="QA mode",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="并行 worker 数",
+    )
+    args = parser.parse_args()
+
+    models = args.model or [LLM_MODEL or "deepseek-v4-pro"]
+
     benchmark_path = _ROOT / "datasets" / "benchmark_hard.json"
     index_path = _ROOT / "data" / "qa_embedding_index.json"
     module_cache = _ROOT / "data" / "module_abstraction.json"
@@ -242,21 +284,18 @@ def main():
         ca.build_from_modules(ma, functions=funcs, calls=calls)
         ca.save()
 
-    # Run concept_symbol with DeepSeek V4 Flash for answer generation
-    ds_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL or None)
-
-    for ds_model in ["deepseek-v4-pro", "deepseek-v4-flash"]:
-        suffix = "deepseek" if ds_model == "deepseek-v4-pro" else "deepseek_flash"
-        mode = f"concept_symbol_{suffix}"
+    for model in models:
+        suffix = model.replace("/", "_")
+        mode = f"{args.mode}_{suffix}"
         output_path = _ROOT / "results" / f"qa_{mode}.json"
         if output_path.exists():
             print(f"\nSkipping {mode} (already exists: {output_path})")
             continue
 
         print(f"\n{'='*60}")
-        print(f"Running {mode} QA with {ds_model}...")
+        print(f"Running {args.mode} QA with {model}...")
         print(f"{'='*60}")
-        results = run_qa("concept_symbol", items, q_embs, ca, retriever, chunks_by_id, repo_root, ds_client, ds_model)
+        results = run_qa(args.mode, items, q_embs, ca, retriever, chunks_by_id, repo_root, model, workers=args.workers)
 
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)

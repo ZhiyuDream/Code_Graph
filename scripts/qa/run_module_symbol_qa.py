@@ -16,12 +16,12 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-from openai import OpenAI
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, REPO_ROOT
+from config import LLM_MODEL, REPO_ROOT
+from src.core.llm_client import call_llm
 from src.core.module_abstraction import ModuleAbstraction
 from src.qa.prompts import PromptBuilder
 from src.qa.retrievers.fast_embedding import FastEmbeddingRetriever
@@ -164,16 +164,14 @@ def baseline_retrieve(
             for r in results]
 
 
-def generate_answer(question: str, context: str, client: OpenAI, model: str) -> str:
-    """调用 LLM 生成答案。"""
+def generate_answer(question: str, context: str, model: str) -> str:
+    """调用 LLM 生成答案（统一走 call_llm）。"""
     prompt = PromptBuilder.answer_generation(question, context)
-    resp = client.chat.completions.create(
-        model=model,
+    return call_llm(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
         max_tokens=4000,
+        model=model,
     )
-    return resp.choices[0].message.content.strip()
 
 
 def process_one(
@@ -184,7 +182,6 @@ def process_one(
     retriever: FastEmbeddingRetriever,
     chunks_by_id: Dict,
     repo_root: Path,
-    client: OpenAI,
     model: str,
 ) -> Dict:
     """处理单个问题。"""
@@ -200,7 +197,7 @@ def process_one(
         raise ValueError(f"Unknown mode: {mode}")
 
     context = build_context(fids, chunks_by_id, repo_root)
-    answer = generate_answer(item["question"], context, client, model)
+    answer = generate_answer(item["question"], context, model)
 
     return {
         "qa_id": item["qa_id"],
@@ -220,7 +217,6 @@ def run_qa_parallel(
     retriever: FastEmbeddingRetriever,
     chunks_by_id: Dict,
     repo_root: Path,
-    client: OpenAI,
     model: str,
     workers: int = 10,
 ) -> List[Dict]:
@@ -230,7 +226,7 @@ def run_qa_parallel(
         futures = {
             executor.submit(
                 process_one,
-                item, q_emb, mode, ma, retriever, chunks_by_id, repo_root, client, model
+                item, q_emb, mode, ma, retriever, chunks_by_id, repo_root, model
             ): idx
             for idx, (item, q_emb) in enumerate(zip(items, q_embs))
         }
@@ -253,12 +249,13 @@ def main():
     parser = argparse.ArgumentParser(description="Run Module-Symbol end-to-end QA")
     parser.add_argument("--mode", choices=["baseline", "module_top5_symbol", "module_top10_symbol"],
                         default="module_top5_symbol", help="QA mode")
-    parser.add_argument("--provider", choices=["openai", "deepseek"], default="deepseek",
-                        help="Answer generation LLM provider")
-    parser.add_argument("--model", default="deepseek-v4-pro", help="Model name")
+    parser.add_argument("--model", default=None,
+                        help="Answer generation model (默认: LLM_MODEL 环境变量，否则 deepseek-v4-pro)")
     parser.add_argument("--workers", type=int, default=15, help="Parallel workers")
     parser.add_argument("--output", default=None, help="Output JSON path")
     args = parser.parse_args()
+
+    model = args.model or LLM_MODEL or "deepseek-v4-pro"
 
     benchmark_path = _ROOT / "datasets" / "benchmark_hard.json"
     index_path = _ROOT / "data" / "qa_embedding_index.json"
@@ -278,22 +275,16 @@ def main():
     if not ma.load():
         raise RuntimeError("Module abstraction not found. Please build it first.")
 
-    # 初始化 LLM client
-    if args.provider == "openai":
-        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-    else:
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL or None)
-
-    print(f"\nRunning {args.mode} QA with {args.model} (workers={args.workers})...")
+    print(f"\nRunning {args.mode} QA with {model} (workers={args.workers})...")
     results = run_qa_parallel(
         args.mode, items, q_embs, ma, retriever, chunks_by_id, repo_root,
-        client, args.model, workers=args.workers
+        model, workers=args.workers
     )
 
     if args.output:
         output_path = Path(args.output)
     else:
-        suffix = args.model.replace("/", "_")
+        suffix = model.replace("/", "_")
         output_path = _ROOT / "results" / f"qa_{args.mode}_{suffix}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
