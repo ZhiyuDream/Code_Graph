@@ -103,7 +103,7 @@ def llm_citation_judge(question: str, reference: str, generated: str, gold_files
         generated_answer=generated,
     )
     try:
-        text = call_judge(prompt, json_mode=True, max_tokens=800)
+        text = call_judge(prompt, json_mode=True, max_tokens=4000)  # reasoning judge 需要更大预算,否则截断成空判
         result = json.loads(text)
         return {
             "coverage_ratio": float(result.get("coverage_ratio", 0)),

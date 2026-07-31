@@ -32,11 +32,20 @@ def ensure_constraints(driver, database: str):
 
 
 def clear_code_graph(driver, database: str):
-    """删除代码图相关节点（保留 Issue/PullRequest）。"""
+    """Delete code graph nodes using Neo4j subtransactions."""
     labels = ["Variable", "Function", "Class", "Attribute", "ControlFlowBlock", "ResourceOperation", "ExternalCall", "AmbiguousCall", "File", "Directory", "Repository", "Module"]
+    batch_size = 1000
     with driver.session(database=database) as session:
         for label in labels:
-            session.run(f"MATCH (n:{label}) DETACH DELETE n")
+            while True:
+                before = session.run(f"MATCH (n:{label}) RETURN count(n) AS count").single()["count"]
+                if not before:
+                    break
+                session.run(
+                    f"CALL {{ MATCH (n:{label}) WITH n LIMIT {batch_size} DETACH DELETE n }} IN TRANSACTIONS OF {batch_size} ROWS"
+                ).consume()
+                after = session.run(f"MATCH (n:{label}) RETURN count(n) AS count").single()["count"]
+                logger.info("Deleted %d %s nodes", before - after, label)
 
 
 def _batch_write_nodes(session, label: str, nodes: list[dict[str, Any]], batch_size: int = BATCH_SIZE, merge: bool = True):

@@ -103,7 +103,7 @@ def _get_client(cfg: ModelConfig) -> OpenAI:
 
 def call_llm(
     messages: list[dict],
-    max_tokens: int = 1000,
+    max_tokens: int | None = 1000,
     timeout: int = 600,
     max_retries: int = 3,
     model: str = None,
@@ -115,7 +115,7 @@ def call_llm(
 
     Args:
         messages: 消息列表
-        max_tokens: 最大token数
+        max_tokens: 最大token数；None 表示不限制（不传该参数）
         timeout: 超时时间（秒）
         max_retries: 最大重试次数
         model: 模型名称（默认使用 LLM_MODEL）
@@ -137,8 +137,9 @@ def call_llm(
                 'model': cfg.name,
                 'messages': messages,
                 'timeout': timeout,
-                cfg.max_tokens_param: max_tokens,
             }
+            if max_tokens is not None:
+                kwargs[cfg.max_tokens_param] = max_tokens
             kwargs.update(extra_kwargs)
 
             resp = client.chat.completions.create(**kwargs)
