@@ -442,17 +442,26 @@ class ReactAgent:
             thought = decision.get("thought", "")
             reason = decision.get("reason", "")
 
-            # 强制防循环：如果 read_file/read_lines/read_function 同一个文件超过 2 次，强制 finish
+            # 防循环：如果 read_file/read_lines/read_function 同一个文件超过 2 次，强制换 search_symbol
             if action in ("read_file", "read_lines", "read_function"):
                 file_path = action_input.get("file_path", "")
                 if ":" in file_path:
                     file_path = file_path.split(":")[0]
                 self.read_count[file_path] += 1
                 if self.read_count[file_path] > 2:
-                    action = "finish"
-                    action_input = {"reason": f"检测到重复读取 {file_path} 超过 2 次，强制结束调查防止循环"}
-                    thought = f"检测到重复读取 {file_path}，强制结束调查"
-                    reason = "强制防循环"
+                    # 强制改为 search_symbol，让 Agent 探索新方向
+                    symbols = extract_symbols(question)
+                    if symbols:
+                        action = "search_symbol"
+                        action_input = {"symbol_name": symbols[0]}
+                        thought = f"检测到重复读取 {file_path}，强制改为搜索符号 {symbols[0]} 探索新方向"
+                        reason = "强制防循环"
+                    else:
+                        # 如果没有可用 symbol，强制 finish
+                        action = "finish"
+                        action_input = {"reason": f"检测到重复读取 {file_path} 超过 2 次，防止陷入循环"}
+                        thought = f"检测到重复读取 {file_path}，强制结束调查"
+                        reason = "强制防循环"
 
             observation, new_files = self.execute(action, action_input)
 
