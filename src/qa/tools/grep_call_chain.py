@@ -38,9 +38,14 @@ def grep_files(pattern: str, repo_root: Path, limit: int = 10) -> list[str]:
 
 
 def grep_callers(function_name: str, repo_root: Path, limit: int = 10) -> list[dict]:
-    """Find locations that call function_name using grep.
+    """Find functions that call function_name.
 
-    Simply grep for "function_name(" and return matching files/lines.
+    Approach:
+    1. Grep for files containing "function_name("
+    2. For each file, extract all function definitions
+    3. Check which function's body contains the matching line
+    4. Return those functions as callers
+
     Returns list of dicts: {"name": str, "file": str, "line": int, "content": str}
     """
     if not function_name:
@@ -55,32 +60,61 @@ def grep_callers(function_name: str, repo_root: Path, limit: int = 10) -> list[d
             abs_path = repo_root / fp
             with open(abs_path, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
+
+            # 找到所有包含 function_name( 的行号
+            match_lines = []
             for i, line in enumerate(lines, 1):
-                if re.search(rf"\b{re.escape(function_name)}\s*\(", line):
+                if re.search(pattern, line):
                     stripped = line.strip()
-                    # 只排除注释行，不排除定义（定义也是重要信息）
                     if stripped.startswith("//") or stripped.startswith("*"):
                         continue
-                    # 向上回溯，找到调用方函数名
-                    caller_name = ""
-                    for j in range(i - 1, max(-1, i - 20), -1):
-                        prev_line = lines[j].strip()
-                        # 匹配函数定义：ret_type func_name( 或 namespace::func_name(
-                        m = re.match(r"^(?:[\w:<>]+\s+)*?([a-zA-Z_][a-zA-Z0-9_:]*)\s*\([^)]*\)\s*(?:const)?\s*\{?", prev_line)
-                        if m:
-                            caller_name = m.group(1).split("::")[-1]
-                            break
-                    callers.append({
-                        "name": caller_name,
-                        "file": fp,
-                        "line": i,
-                        "content": stripped,
-                    })
-                    break
+                    match_lines.append((i, stripped))
+
+            if not match_lines:
+                continue
+
+            # 提取文件中的所有函数定义
+            func_defs = []  # (name, start_line, end_line)
+            brace_count = 0
+            current_func = None
+            current_start = 0
+
+            # 匹配函数定义，排除控制语句（if/for/while/switch/catch）
+            func_pattern = re.compile(r"^\s*(?!if\b|for\b|while\b|switch\b|catch\b)(?:[\w:<>]+\s+)*?([a-zA-Z_][a-zA-Z0-9_:]*)\s*\([^)]*\)\s*(?:const)?\s*\{")
+            for i, line in enumerate(lines, 1):
+                m = func_pattern.match(line)
+                if m:
+                    if current_func is not None:
+                        func_defs.append((current_func, current_start, i - 1))
+                    current_func = m.group(1).split("::")[-1]
+                    current_start = i
+                    brace_count = 1
+                elif current_func is not None:
+                    brace_count += line.count("{") - line.count("}")
+                    if brace_count == 0:
+                        func_defs.append((current_func, current_start, i))
+                        current_func = None
+
+            if current_func is not None:
+                func_defs.append((current_func, current_start, len(lines)))
+
+            # 对每个匹配行，找到包含它的函数
+            for line_num, content in match_lines:
+                caller_name = ""
+                for name, start, end in func_defs:
+                    if start <= line_num <= end:
+                        caller_name = name
+                        break
+                callers.append({
+                    "name": caller_name,
+                    "file": fp,
+                    "line": line_num,
+                    "content": content,
+                })
+                if len(callers) >= limit:
+                    return callers
         except Exception:
             continue
-        if len(callers) >= limit:
-            break
     return callers[:limit]
 
 

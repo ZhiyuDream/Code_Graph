@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Concept-Symbol + Embedding 初始探索 + ReAct 逐步扩展 QA。
+"""Concept-Symbol + ReAct 循环调研 QA。
 
 流程：
-1. Concept-Symbol retrieval 得到 top-K 准确函数位置（name, file_path, start_line, end_line）
-2. ReAct Agent 从这些准确位置开始：
-   - read_function 读取函数实现
-   - grep_callers / grep_callees 沿调用链扩展
-   - read_file / read_lines 深入阅读相关文件
-   - finish 结束调查
-3. 生成最终答案
+1. Concept-Symbol Embedding Retrieval（初始召回）
+2. ReAct 循环调研：
+   - read_function 读取完整实现（必须看完整实现才能判断相关性）
+   - 相关 → 分析调用链（grep A 找上游，grep B 找下游）
+   - 不相关 → 换关键词重新 embedding（Agent 自己决定换什么）
+   - 读代码过程中受启发想到新关键词 → 用新关键词 embedding
+   - 维护已看过的文件/函数，避免重复
+3. 生成答案
 
-核心改进：初始函数位置来自 Concept-Symbol 准确索引，不是 Agent 猜测，确保 read_function 成功率。
+核心原则：
+- Concept-Symbol Embedding 是 ReAct 的一个工具，可以多次使用
+- 必须看完整实现才能判断相关性
+- Agent 自己决定换什么关键词、在哪个目录 embedding
+- 维护已看过的文件/函数，避免重复
 """
 from __future__ import annotations
 
@@ -32,7 +37,7 @@ from src.core.llm_client import call_llm, call_llm_json
 from src.core.concept_abstraction import ConceptAbstraction
 from src.core.module_abstraction import ModuleAbstraction
 from src.qa.retrievers.fast_embedding import FastEmbeddingRetriever
-from src.qa.tools.grep_call_chain import grep_files, grep_callers, grep_callees, read_function
+from src.qa.tools.grep_call_chain import grep_files, read_function
 from scripts.analysis.eval_region_compression import (
     fetch_functions_and_calls,
     load_benchmark,
@@ -112,7 +117,6 @@ def concept_symbol_retrieve_functions(
 
     scored.sort(key=lambda x: -x[1])
 
-    # 转换为带准确位置的函数信息
     functions = []
     for fid, score in scored[:top_funcs]:
         meta = chunks_by_id.get(fid, {}).get("meta", {})
@@ -130,21 +134,6 @@ def concept_symbol_retrieve_functions(
 
 # ── ReAct Agent ─────────────────────────────────────────────────────
 
-def get_repo_structure(repo_root: Path, max_depth: int = 3) -> str:
-    """获取仓库目录结构，帮助 Agent 像人类一样先浏览目录再决定探索方向。"""
-    lines = []
-    for depth in range(1, max_depth + 1):
-        for path in sorted(repo_root.rglob("*")):
-            if path.is_dir():
-                rel = path.relative_to(repo_root)
-                parts = rel.parts
-                if len(parts) == depth:
-                    indent = "  " * (depth - 1)
-                    code_files = list(path.glob("*.cpp")) + list(path.glob("*.c")) + list(path.glob("*.h")) + list(path.glob("*.hpp"))
-                    lines.append(f"{indent}{path.name}/ ({len(code_files)} code files)")
-    return "\n".join(lines[:100])
-
-
 REACT_PROMPT = """你是一位代码审计专家。检索系统已经为你找到了一批**准确的函数位置**，你需要从这些函数开始，逐步扩展构建证据链。
 
 【当前问题】
@@ -156,28 +145,11 @@ REACT_PROMPT = """你是一位代码审计专家。检索系统已经为你找�
 【检索系统提供的候选函数】（按相关性排序，文件路径准确）
 {candidate_functions}
 
-【你已访问的文件及相关性】（帮助你判断哪些方向已经探索过）
-{visited_files_with_relevance}
+【你已看过的函数及相关性】（帮助你判断哪些已经看过、是否相关）
+{visited_functions}
 
-【你已访问的目录及次数】
-{visited_dirs}
-
-【你重复读取的文件及次数】（提醒你不要陷入循环）
-{read_count}
-
-【你已确认不相关的文件】（排除这些方向）
-{irrelevant_files}
-
-【你已尝试但失败的搜索关键词】（排除这些关键词）
-{failed_searches}
-
-【目录语义提示】
-- `common/`：通用工具函数（聊天模板、参数解析、采样、字符串处理等）
-- `src/`：核心模型代码（模型加载、推理、上下文管理等）
-- `ggml/`：底层计算图和后端（各种硬件后端如 SYCL/CUDA/CANN/Vulkan 等）
-- `tests/`：测试代码（通常包含函数的使用示例）
-- `tools/`：工具代码（服务器、分析工具等）
-- `examples/`：示例代码
+【你已看过的文件】
+{visited_files}
 
 【你已执行过的动作】
 {action_history}
@@ -186,37 +158,32 @@ REACT_PROMPT = """你是一位代码审计专家。检索系统已经为你找�
 
 你可以使用以下工具：
 
-1. **read_function(function_name, file_path)** — 直接读取某个函数的完整实现（文件路径必须来自候选函数或 search_symbol 结果）
+1. **read_function(function_name, file_path)** — 直接读取某个函数的完整实现（必须看完整实现才能判断相关性）
 2. **read_file(file_path)** — 读取完整文件内容
 3. **read_lines(file_path, start_line, end_line)** — 读取文件的指定行号范围
-4. **grep_callers(function_name)** — 用 grep 搜索调用该函数的所有位置（找谁调用了它）
-5. **grep_callees(function_name, file_path, start_line, end_line)** — 从函数定义中提取被调用的函数（找它调用了谁）
-6. **search_symbol(symbol_name)** — 搜索仓库中包含该符号的所有文件
-7. **finish(reason)** — 认为已有足够证据，结束调查并生成答案
+4. **search_symbol(symbol_name)** — 搜索仓库中包含该符号的所有文件（也是 embedding 检索工具，可以多次使用）
+5. **finish(reason)** — 认为已有足够证据，结束调查并生成答案
 
 ---
 
 【决策规则】
-1. **先探索再 finish**：前 3 步不能 finish，必须先 read_function / read_file / search_symbol 探索；如果你没有访问到任何相关文件，不能 finish
-2. **先看目录结构**：根据仓库目录结构和目录语义提示，判断哪个目录最可能包含相关实现
-3. **从候选函数开始**：优先用 read_function 读取候选函数的实现，不要一开始就 search_symbol
-4. **排除失败方向，重新定位出发点**：如果某个关键词 search_symbol 失败、某个文件读起来不相关，把它们加入排除列表，根据已有信息重新选择一个新的出发点（新的关键词、新的目录、新的函数）
-5. **文件路径必须准确**：read_function 的 file_path 必须来自候选函数或 search_symbol 结果，不要猜测
-6. **根据中文问题语义猜测函数名**：不要机械提取英文标识符，而是根据问题语义猜测可能的函数名/类名/变量名，然后用 search_symbol 验证
-7. **打转就换**：如果你一直在同一个文件或目录打转，连续 2-3 步没有获得新信息，立即换其他文件或目录，不要硬撑
-8. **找到相关文件必须 read**：如果 search_symbol 或 grep_callers 返回了相关文件，下一步必须 read_file 或 read_function 读取它，不要只是知道它存在就跳过
-9. **标记文件相关性（重要）**：
-   - **只有读完整文件才能标记为"不相关"**：如果文件没读完（read_file 截断或 read_lines 未到末尾），不能标记为"不相关"
-   - **读到一半发现相关可以停下来标记为"相关"**：如果读到一半发现文件与问题相关，可以立即标记为"相关"，不用读完
-   - 如果文件太大，可以用 read_lines 分段读取，直到读完或确认相关
-10. **优先使用调用链扩展**：当你发现一个关键函数时，优先用 grep_callers 找它的调用方，或用 grep_callees 找它调用的函数
-11. **同文件扩展**：当你读一个函数时，注意观察同文件其他相关函数，可以顺便查看
-12. **避免重复**：不要重复读同一个文件超过 2 次；如果已经读过，换其他文件或工具
-13. **search_symbol 技巧**：从问题语义中猜测可能的函数名，不要搜空字符串或过于宽泛的词，不要重复搜已经失败的关键词
-14. **每次只选择一个工具**，给出明确的理由
-15. **最多 {max_steps} 步**，当前第 {current_step} 步
-16. **不需要读完所有候选文件**，只要证据充分就可以停止
-17. **诚实原则（最重要）**：
+1. **从候选函数开始**：优先用 read_function 读取候选函数的实现，不要一开始就 search_symbol
+2. **必须看完整实现才能判断相关性**：不能只看函数名或签名，必须 read_function 看完整实现后才能判断是否相关
+3. **自己分析调用关系**：读到 A 的实现后，自己分析 A 的函数体，发现 A 调用了谁（找函数体内的函数调用）
+4. **用 search_symbol 构建调用链**：
+   - 发现 A 调用了 B → search_symbol("B") 找到 B 的定义和调用方（下游）
+   - 想知道谁调用了 A → search_symbol("A") 找到 A 的调用方（上游）
+5. **换关键词的时机**：
+   - 当前 embedding 检索到的确实都不相关 → 换关键词重新 search_symbol
+   - 读代码过程中受启发想到新关键词 → 用新关键词 search_symbol
+   - 你可以自己决定换什么关键词，不要机械提取
+6. **维护已看过的函数/文件**：不要重复读同一个函数或文件；如果已经看过，换其他函数或目录
+7. **排除失败方向，重新定位出发点**：如果某个关键词 search_symbol 失败、某个文件读起来不相关，把它们加入排除列表，根据已有信息重新选择一个新的出发点
+8. **文件路径必须准确**：read_function 的 file_path 必须来自候选函数或 search_symbol 结果，不要猜测
+9. **根据中文问题语义猜测函数名**：不要机械提取英文标识符，而是根据问题语义猜测可能的函数名/类名/变量名，然后用 search_symbol 验证
+10. **每次只选择一个工具**，给出明确的理由
+11. **最多 {max_steps} 步**，当前第 {current_step} 步
+12. **诚实原则（最重要）**：
     - 你只能引用你实际访问过的文件和函数
     - 如果工具返回空或找不到，如实说明"无法确认"
     - 绝对不要编造文件路径、函数名、代码内容或调用关系
@@ -226,13 +193,13 @@ REACT_PROMPT = """你是一位代码审计专家。检索系统已经为你找�
 【输出格式】（必须是有效的 JSON）
 {{
   "thought": "你的思考过程...",
-  "action": "read_function|read_file|read_lines|grep_callers|grep_callees|search_symbol|finish",
+  "action": "read_function|read_file|read_lines|search_symbol|finish",
   "action_input": {{"参数名": "参数值"}},
   "reason": "为什么选择这个行动",
-  "file_relevance": {{"file_path": "相关|不相关|未知"}}
+  "function_relevance": {{"function_name": "相关|不相关|未知"}}
 }}
 
-注意：file_relevance 用于标记你读过的文件是否与问题相关，帮助你后续排除不相关方向。如果某个文件读起来不相关，标记为"不相关"，系统会记录并排除。
+注意：function_relevance 用于标记你读过的函数是否与问题相关，帮助你后续维护已看过的函数，避免重复。如果某个函数读起来不相关，标记为"不相关"，系统会记录并排除。
 """
 
 ANSWER_PROMPT = """基于你的调查过程和收集到的证据，回答问题。
@@ -266,18 +233,26 @@ class ReactAgent:
         self.repo_root = repo_root
         self.max_steps = max_steps
         self.visited_files = set()
+        self.visited_functions = {}  # function_name -> relevance (True/False/None)
         self.file_cache = {}
         self.action_history = []
         self.read_count = defaultdict(int)
-        self.visited_dirs = defaultdict(int)
-        # 标记每个文件的相关性：True=相关, False=不相关, None=未知
-        self.file_relevance = {}
-        # 记录失败的搜索关键词，用于排除失败方向
-        self.failed_searches = set()
-        # 强制读取队列：grep_callers/search_symbol 找到的文件，下一步必须读取
-        self.pending_reads = []
         # 预先计算仓库目录结构，像人类一样先浏览目录
-        self.repo_structure = get_repo_structure(repo_root, max_depth=3)
+        self.repo_structure = self._get_repo_structure(repo_root, max_depth=3)
+
+    def _get_repo_structure(self, repo_root: Path, max_depth: int = 3) -> str:
+        """获取仓库目录结构。"""
+        lines = []
+        for depth in range(1, max_depth + 1):
+            for path in sorted(repo_root.rglob("*")):
+                if path.is_dir():
+                    rel = path.relative_to(repo_root)
+                    parts = rel.parts
+                    if len(parts) == depth:
+                        indent = "  " * (depth - 1)
+                        code_files = list(path.glob("*.cpp")) + list(path.glob("*.c")) + list(path.glob("*.h")) + list(path.glob("*.hpp"))
+                        lines.append(f"{indent}{path.name}/ ({len(code_files)} code files)")
+        return "\n".join(lines[:100])
 
     def _read_file(self, file_path: str) -> str:
         if file_path not in self.file_cache:
@@ -288,18 +263,6 @@ class ReactAgent:
             except Exception:
                 self.file_cache[file_path] = ""
         return self.file_cache[file_path]
-
-    def _get_file_functions(self, file_path: str) -> list[str]:
-        content = self._read_file(file_path)
-        if not content:
-            return []
-        pattern = re.compile(r"^\s*(?:[\w:<>]+\s+)*?([a-zA-Z_][a-zA-Z0-9_:]*)\s*\([^)]*\)\s*(?:const)?\s*\{")
-        functions = []
-        for line in content.split("\n"):
-            m = pattern.match(line)
-            if m:
-                functions.append(m.group(1))
-        return functions[:20]
 
     def execute(self, action: str, action_input: dict) -> tuple[str, list]:
         observation = ""
@@ -313,14 +276,9 @@ class ReactAgent:
             else:
                 content = self._read_file(file_path)
                 self.visited_files.add(file_path)
-                self.visited_dirs[str(Path(file_path).parent)] += 1
-                # 标记是否读完整个文件
-                is_complete = len(content) <= 5000
                 observation = f"文件 {file_path} 内容:\n```cpp\n{content[:5000]}\n```"
                 if len(content) > 5000:
-                    observation += f"\n... (截断，共 {len(content)} 字符，未读完)"
-                else:
-                    observation += f"\n... (已读完整个文件)"
+                    observation += f"\n... (截断，共 {len(content)} 字符)"
                 new_files = [file_path]
 
         elif action == "read_lines":
@@ -337,20 +295,13 @@ class ReactAgent:
                 e = min(len(lines), end)
                 snippet = "\n".join(lines[s:e])
                 self.visited_files.add(file_path)
-                self.visited_dirs[str(Path(file_path).parent)] += 1
-                # 标记是否读完整个文件
-                is_complete = e >= len(lines)
                 observation = f"文件 {file_path} 第 {start}-{end} 行:\n```cpp\n{snippet}\n```"
-                if is_complete:
-                    observation += f"\n... (已读到文件末尾)"
-                else:
-                    observation += f"\n... (文件共 {len(lines)} 行，未读完)"
                 new_files = [file_path]
 
         elif action == "read_function":
             func_name = action_input.get("function_name", "")
             file_path = action_input.get("file_path", "")
-            # 清理文件路径：去掉行号部分（如 common/chat.cpp:2133-2240 → common/chat.cpp）
+            # 清理文件路径：去掉行号部分
             if ":" in file_path:
                 file_path = file_path.split(":")[0]
             if not func_name:
@@ -366,48 +317,8 @@ class ReactAgent:
                     new_files = []
                 else:
                     self.visited_files.add(file_path)
-                    self.visited_dirs[str(Path(file_path).parent)] += 1
-                    other_funcs = self._get_file_functions(file_path)
-                    other_funcs = [f for f in other_funcs if f != func_name][:10]
                     observation = f"函数 {func_name} ({file_path}:{result['start_line']}-{result['end_line']}):\n```cpp\n{result['code']}\n```"
-                    if other_funcs:
-                        observation += f"\n\n同文件其他函数（可顺便查看）: {', '.join(other_funcs)}"
                     new_files = [file_path]
-
-        elif action == "grep_callers":
-            func_name = action_input.get("function_name", "")
-            if not func_name:
-                observation = "错误：grep_callers 缺少 function_name 参数"
-                new_files = []
-            else:
-                callers = grep_callers(func_name, self.repo_root, limit=10)
-                files = list(set(c["file"] for c in callers))
-                observation = f"找到 {len(callers)} 个调用 '{func_name}' 的位置:\n" + "\n".join(
-                    f"- {c['file']}:{c['line']}: {c['content'][:80]}" for c in callers[:10]
-                )
-                # 把找到的文件加入强制读取队列
-                for f in files:
-                    if f not in self.visited_files and f not in self.pending_reads:
-                        self.pending_reads.append(f)
-                new_files = files
-
-        elif action == "grep_callees":
-            func_name = action_input.get("function_name", "")
-            file_path = action_input.get("file_path", "")
-            start = action_input.get("start_line", 1)
-            end = action_input.get("end_line", start + 50)
-            if not func_name:
-                observation = "错误：grep_callees 缺少 function_name 参数"
-                new_files = []
-            elif not file_path:
-                observation = "错误：grep_callees 缺少 file_path 参数"
-                new_files = []
-            else:
-                callees = grep_callees(func_name, file_path, start, end, self.repo_root, limit=10)
-                observation = f"函数 '{func_name}' 调用了:\n" + "\n".join(
-                    f"- {c['name']} @ {c['file']}" for c in callees[:10]
-                )
-                new_files = [c["file"] for c in callees]
 
         elif action == "search_symbol":
             symbol = action_input.get("symbol_name", "").strip()
@@ -416,14 +327,7 @@ class ReactAgent:
                 new_files = []
             else:
                 files = grep_files(rf"\b{re.escape(symbol)}\b", self.repo_root, limit=10)
-                if not files:
-                    # 记录失败的搜索关键词，用于排除失败方向
-                    self.failed_searches.add(symbol)
                 observation = f"找到 {len(files)} 个文件包含 '{symbol}':\n" + "\n".join(f"- {f}" for f in files)
-                # 把找到的文件加入强制读取队列
-                for f in files:
-                    if f not in self.visited_files and f not in self.pending_reads:
-                        self.pending_reads.append(f)
                 new_files = files
 
         elif action == "finish":
@@ -451,39 +355,18 @@ class ReactAgent:
                 for s in steps[-5:]
             ) or "(无)"
 
-            visited_dirs_str = "\n".join(
-                f"- {d} (访问 {c} 次)" for d, c in sorted(self.visited_dirs.items(), key=lambda x: -x[1])
-            ) or "(无)"
-
-            read_count_str = "\n".join(
-                f"- {f} (已读 {c} 次)" for f, c in sorted(self.read_count.items(), key=lambda x: -x[1]) if c > 1
-            ) or "(无)"
-
-            # 构建已访问文件及相关性字符串
-            visited_files_with_relevance = "\n".join(
-                f"- {f} ({'相关' if self.file_relevance.get(f) is True else '不相关' if self.file_relevance.get(f) is False else '未知'})"
-                for f in sorted(self.visited_files)
-            ) or "(无)"
-
-            # 从 file_relevance 中获取不相关文件
-            irrelevant_files_str = "\n".join(
-                f"- {f}" for f in sorted(self.visited_files) if self.file_relevance.get(f) is False
-            ) or "(无)"
-
-            # 构建失败搜索关键词字符串
-            failed_searches_str = "\n".join(
-                f"- {s}" for s in sorted(self.failed_searches)
+            # 构建已看过的函数及相关性字符串
+            visited_functions_str = "\n".join(
+                f"- {name} ({'相关' if rel is True else '不相关' if rel is False else '未知'})"
+                for name, rel in sorted(self.visited_functions.items())
             ) or "(无)"
 
             prompt = REACT_PROMPT.format(
                 question=question,
                 repo_structure=self.repo_structure,
                 candidate_functions=candidate_functions,
-                visited_files_with_relevance=visited_files_with_relevance,
-                visited_dirs=visited_dirs_str,
-                read_count=read_count_str,
-                irrelevant_files=irrelevant_files_str,
-                failed_searches=failed_searches_str,
+                visited_functions=visited_functions_str,
+                visited_files="\n".join(f"- {f}" for f in sorted(self.visited_files)) or "(无)",
                 action_history=action_history,
                 max_steps=self.max_steps,
                 current_step=step_num,
@@ -502,23 +385,15 @@ class ReactAgent:
             thought = decision.get("thought", "")
             reason = decision.get("reason", "")
 
-            # 记录 LLM 返回的文件相关性
-            file_relevance = decision.get("file_relevance", {})
-            for fp, rel in file_relevance.items():
+            # 记录 LLM 返回的函数相关性
+            function_relevance = decision.get("function_relevance", {})
+            for fn, rel in function_relevance.items():
                 if rel == "相关":
-                    self.file_relevance[fp] = True
+                    self.visited_functions[fn] = True
                 elif rel == "不相关":
-                    self.file_relevance[fp] = False
+                    self.visited_functions[fn] = False
                 else:
-                    self.file_relevance[fp] = None
-
-            # 强制机制：如果 pending_reads 非空，下一步必须 read_file 或 read_function
-            if self.pending_reads and action not in ("read_file", "read_function", "finish"):
-                next_file = self.pending_reads.pop(0)
-                action = "read_file"
-                action_input = {"file_path": next_file}
-                thought = f"强制读取 {next_file}（因为上一步 grep_callers/search_symbol 找到了它）"
-                reason = "强制读取找到的文件"
+                    self.visited_functions[fn] = None
 
             # 防循环：如果 read_file/read_lines/read_function 同一个文件超过 2 次，强制换 search_symbol
             if action in ("read_file", "read_lines", "read_function"):
@@ -528,18 +403,10 @@ class ReactAgent:
                 self.read_count[file_path] += 1
                 if self.read_count[file_path] > 2:
                     # 强制改为 search_symbol，让 Agent 探索新方向
-                    symbols = extract_symbols(question)
-                    if symbols:
-                        action = "search_symbol"
-                        action_input = {"symbol_name": symbols[0]}
-                        thought = f"检测到重复读取 {file_path}，强制改为搜索符号 {symbols[0]} 探索新方向"
-                        reason = "强制防循环"
-                    else:
-                        # 如果没有可用 symbol，强制 finish
-                        action = "finish"
-                        action_input = {"reason": f"检测到重复读取 {file_path} 超过 2 次，防止陷入循环"}
-                        thought = f"检测到重复读取 {file_path}，强制结束调查"
-                        reason = "强制防循环"
+                    action = "search_symbol"
+                    action_input = {"symbol_name": "device"}
+                    thought = f"检测到重复读取 {file_path}，强制改为 search_symbol 探索新方向"
+                    reason = "强制防循环"
 
             observation, new_files = self.execute(action, action_input)
 
@@ -595,6 +462,7 @@ class ReactAgent:
             "answer": answer,
             "steps": steps,
             "visited_files": list(self.visited_files),
+            "visited_functions": self.visited_functions,
             "files_content": files_content,
         }
 
@@ -620,6 +488,7 @@ def process_one(item, q_emb, ca, retriever, chunks_by_id, repo_root, model, max_
         "answer": result["answer"],
         "initial_functions": initial_functions,
         "visited_files": result["visited_files"],
+        "visited_functions": result["visited_functions"],
         "steps": result["steps"],
         "model": model,
     }
@@ -628,7 +497,7 @@ def process_one(item, q_emb, ca, retriever, chunks_by_id, repo_root, model, max_
 def main():
     parser = argparse.ArgumentParser(description="Concept-Symbol + ReAct QA")
     parser.add_argument("--model", default=None, help="LLM model")
-    parser.add_argument("--max-steps", type=int, default=50)
+    parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--workers", type=int, default=30)
     parser.add_argument("--output", default=None)
     parser.add_argument("--limit", type=int, default=None)
@@ -691,7 +560,7 @@ def main():
         output_path = Path(args.output)
     else:
         suffix = model.replace("/", "_")
-        output_path = _ROOT / "results" / f"qa_react_concept_symbol_v7_{suffix}.json"
+        output_path = _ROOT / "results" / f"qa_react_concept_symbol_{suffix}.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
