@@ -193,7 +193,7 @@ MAIN_PROMPT = load_prompt("main_answer_from_audit")
 
 
 def audit_file(question: str, file_path: str, funcs: list, model: str) -> dict:
-    """子 Agent：审计单个文件中的函数与问题的相关性。"""
+    """子 Agent：审计单个文件中的函数与问题的相关性，并提取关键代码片段。"""
     functions_code = ""
     for f in funcs:
         functions_code += f"--- Function: {f['name']} ({f['start_line']}-{f['end_line']}) ---\n"
@@ -207,16 +207,21 @@ def audit_file(question: str, file_path: str, funcs: list, model: str) -> dict:
 
     result = call_llm_json(
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1000,
+        max_tokens=2000,
         model=model,
     )
     if result is None:
-        return {"file_path": file_path, "relevant_functions": [], "reason": "parse failed", "audit_error": True}
+        return {
+            "file_path": file_path,
+            "relevant_functions": [],
+            "uncertain_functions": [],
+            "audit_error": True,
+        }
 
     return {
         "file_path": file_path,
         "relevant_functions": result.get("relevant_functions", []),
-        "reason": result.get("reason", ""),
+        "uncertain_functions": result.get("uncertain_functions", []),
         "audit_error": False,
     }
 
@@ -226,8 +231,32 @@ def generate_final_answer(question: str, audit_results: list, model: str) -> str
     audit_text = ""
     for r in audit_results:
         audit_text += f"--- File: {r['file_path']} ---\n"
-        audit_text += f"Relevant functions: {', '.join(r['relevant_functions'])}\n"
-        audit_text += f"Reason: {r['reason']}\n\n"
+
+        # 相关函数
+        if r.get("relevant_functions"):
+            audit_text += "Relevant functions:\n"
+            for fn in r["relevant_functions"]:
+                if isinstance(fn, dict):
+                    audit_text += f"  - {fn.get('name', '')}: {fn.get('reason', '')}\n"
+                    if fn.get("key_code"):
+                        audit_text += f"    Code:\n{fn['key_code']}\n"
+                else:
+                    audit_text += f"  - {fn}\n"
+        else:
+            audit_text += "Relevant functions: (none)\n"
+
+        # 不确定函数
+        if r.get("uncertain_functions"):
+            audit_text += "Uncertain functions (please judge yourself):\n"
+            for fn in r["uncertain_functions"]:
+                if isinstance(fn, dict):
+                    audit_text += f"  - {fn.get('name', '')}: {fn.get('reason', '')}\n"
+                    if fn.get("key_code"):
+                        audit_text += f"    Code:\n{fn['key_code']}\n"
+                else:
+                    audit_text += f"  - {fn}\n"
+
+        audit_text += "\n"
 
     prompt = MAIN_PROMPT.format(question=question, audit_results=audit_text)
     return call_llm(
@@ -346,8 +375,8 @@ def main():
     parser = argparse.ArgumentParser(description="Run Concept-Symbol Full-File QA with Sub-Agent Audit")
     parser.add_argument("--model", default=None, help="Answer generation model")
     parser.add_argument("--subagent-model", default=None, help="Sub-agent audit model (default: same as model)")
-    parser.add_argument("--workers", type=int, default=5, help="Sub-agent workers per question")
-    parser.add_argument("--qa-workers", type=int, default=3, help="Parallel question workers")
+    parser.add_argument("--workers", type=int, default=10, help="Sub-agent workers per question")
+    parser.add_argument("--qa-workers", type=int, default=5, help="Parallel question workers")
     parser.add_argument("--use-relation-expansion", action="store_true", default=True)
     parser.add_argument("--no-relation-expansion", dest="use_relation_expansion", action="store_false")
     parser.add_argument("--semantic-relations", type=Path, default=Path("data/semantic_relations.json"))

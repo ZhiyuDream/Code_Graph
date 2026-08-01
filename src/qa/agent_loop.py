@@ -10,7 +10,7 @@ from .tools import (
     expand_callers, expand_callees
 )
 from .tools.class_reader import expand_class
-from .tools.file_reader import read_full_file
+from src.search.code_reader import read_full_file
 from .retrievers.grep import GrepRetriever
 from .retrievers.embedding import EmbeddingRetriever
 from src.core.llm_client import call_llm_json

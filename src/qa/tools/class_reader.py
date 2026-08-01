@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ..models import RetrievedFunction
-from .file_reader import read_lines, find_class_bounds
+from src.search.code_reader import read_file_lines, find_class_bounds
 from config import NEO4J_DATABASE
 
 
