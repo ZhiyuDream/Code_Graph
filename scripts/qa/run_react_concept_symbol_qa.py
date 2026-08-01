@@ -156,14 +156,20 @@ REACT_PROMPT = """你是一位代码审计专家。检索系统已经为你找�
 【检索系统提供的候选函数】（按相关性排序，文件路径准确）
 {candidate_functions}
 
-【你已访问的文件】
-{visited_files}
+【你已访问的文件及相关性】（帮助你判断哪些方向已经探索过）
+{visited_files_with_relevance}
 
 【你已访问的目录及次数】
 {visited_dirs}
 
 【你重复读取的文件及次数】（提醒你不要陷入循环）
 {read_count}
+
+【你已确认不相关的文件】（排除这些方向）
+{irrelevant_files}
+
+【你已尝试但失败的搜索关键词】（排除这些关键词）
+{failed_searches}
 
 【目录语义提示】
 - `common/`：通用工具函数（聊天模板、参数解析、采样、字符串处理等）
@@ -191,20 +197,26 @@ REACT_PROMPT = """你是一位代码审计专家。检索系统已经为你找�
 ---
 
 【决策规则】
-1. **先看目录结构**：根据仓库目录结构和目录语义提示，判断哪个目录最可能包含相关实现
-2. **从候选函数开始**：优先用 read_function 读取候选函数的实现，不要一开始就 search_symbol
-3. **文件路径必须准确**：read_function 的 file_path 必须来自候选函数或 search_symbol 结果，不要猜测
-4. **根据中文问题语义猜测函数名**：不要机械提取英文标识符，而是根据问题语义猜测可能的函数名/类名/变量名，然后用 search_symbol 验证
-5. **打转就换**：如果你一直在同一个文件或目录打转，连续 2-3 步没有获得新信息，立即换其他文件或目录，不要硬撑
-6. **找到相关文件必须 read**：如果 search_symbol 或 grep_callers 返回了相关文件，下一步必须 read_file 或 read_function 读取它，不要只是知道它存在就跳过
-7. **优先使用调用链扩展**：当你发现一个关键函数时，优先用 grep_callers 找它的调用方，或用 grep_callees 找它调用的函数
-8. **同文件扩展**：当你读一个函数时，注意观察同文件其他相关函数，可以顺便查看
-9. **避免重复**：不要重复读同一个文件超过 2 次；如果已经读过，换其他文件或工具
-10. **search_symbol 技巧**：从问题语义中猜测可能的函数名，不要搜空字符串或过于宽泛的词
-11. **每次只选择一个工具**，给出明确的理由
-12. **最多 {max_steps} 步**，当前第 {current_step} 步
-13. **不需要读完所有候选文件**，只要证据充分就可以停止
-14. **诚实原则（最重要）**：
+1. **先探索再 finish**：前 3 步不能 finish，必须先 read_function / read_file / search_symbol 探索；如果你没有访问到任何相关文件，不能 finish
+2. **先看目录结构**：根据仓库目录结构和目录语义提示，判断哪个目录最可能包含相关实现
+3. **从候选函数开始**：优先用 read_function 读取候选函数的实现，不要一开始就 search_symbol
+4. **排除失败方向，重新定位出发点**：如果某个关键词 search_symbol 失败、某个文件读起来不相关，把它们加入排除列表，根据已有信息重新选择一个新的出发点（新的关键词、新的目录、新的函数）
+5. **文件路径必须准确**：read_function 的 file_path 必须来自候选函数或 search_symbol 结果，不要猜测
+6. **根据中文问题语义猜测函数名**：不要机械提取英文标识符，而是根据问题语义猜测可能的函数名/类名/变量名，然后用 search_symbol 验证
+7. **打转就换**：如果你一直在同一个文件或目录打转，连续 2-3 步没有获得新信息，立即换其他文件或目录，不要硬撑
+8. **找到相关文件必须 read**：如果 search_symbol 或 grep_callers 返回了相关文件，下一步必须 read_file 或 read_function 读取它，不要只是知道它存在就跳过
+9. **标记文件相关性（重要）**：
+   - **只有读完整文件才能标记为"不相关"**：如果文件没读完（read_file 截断或 read_lines 未到末尾），不能标记为"不相关"
+   - **读到一半发现相关可以停下来标记为"相关"**：如果读到一半发现文件与问题相关，可以立即标记为"相关"，不用读完
+   - 如果文件太大，可以用 read_lines 分段读取，直到读完或确认相关
+10. **优先使用调用链扩展**：当你发现一个关键函数时，优先用 grep_callers 找它的调用方，或用 grep_callees 找它调用的函数
+11. **同文件扩展**：当你读一个函数时，注意观察同文件其他相关函数，可以顺便查看
+12. **避免重复**：不要重复读同一个文件超过 2 次；如果已经读过，换其他文件或工具
+13. **search_symbol 技巧**：从问题语义中猜测可能的函数名，不要搜空字符串或过于宽泛的词，不要重复搜已经失败的关键词
+14. **每次只选择一个工具**，给出明确的理由
+15. **最多 {max_steps} 步**，当前第 {current_step} 步
+16. **不需要读完所有候选文件**，只要证据充分就可以停止
+17. **诚实原则（最重要）**：
     - 你只能引用你实际访问过的文件和函数
     - 如果工具返回空或找不到，如实说明"无法确认"
     - 绝对不要编造文件路径、函数名、代码内容或调用关系
@@ -216,8 +228,11 @@ REACT_PROMPT = """你是一位代码审计专家。检索系统已经为你找�
   "thought": "你的思考过程...",
   "action": "read_function|read_file|read_lines|grep_callers|grep_callees|search_symbol|finish",
   "action_input": {{"参数名": "参数值"}},
-  "reason": "为什么选择这个行动"
+  "reason": "为什么选择这个行动",
+  "file_relevance": {{"file_path": "相关|不相关|未知"}}
 }}
+
+注意：file_relevance 用于标记你读过的文件是否与问题相关，帮助你后续排除不相关方向。如果某个文件读起来不相关，标记为"不相关"，系统会记录并排除。
 """
 
 ANSWER_PROMPT = """基于你的调查过程和收集到的证据，回答问题。
@@ -255,6 +270,12 @@ class ReactAgent:
         self.action_history = []
         self.read_count = defaultdict(int)
         self.visited_dirs = defaultdict(int)
+        # 标记每个文件的相关性：True=相关, False=不相关, None=未知
+        self.file_relevance = {}
+        # 记录失败的搜索关键词，用于排除失败方向
+        self.failed_searches = set()
+        # 强制读取队列：grep_callers/search_symbol 找到的文件，下一步必须读取
+        self.pending_reads = []
         # 预先计算仓库目录结构，像人类一样先浏览目录
         self.repo_structure = get_repo_structure(repo_root, max_depth=3)
 
@@ -293,9 +314,13 @@ class ReactAgent:
                 content = self._read_file(file_path)
                 self.visited_files.add(file_path)
                 self.visited_dirs[str(Path(file_path).parent)] += 1
+                # 标记是否读完整个文件
+                is_complete = len(content) <= 5000
                 observation = f"文件 {file_path} 内容:\n```cpp\n{content[:5000]}\n```"
                 if len(content) > 5000:
-                    observation += f"\n... (截断，共 {len(content)} 字符)"
+                    observation += f"\n... (截断，共 {len(content)} 字符，未读完)"
+                else:
+                    observation += f"\n... (已读完整个文件)"
                 new_files = [file_path]
 
         elif action == "read_lines":
@@ -313,7 +338,13 @@ class ReactAgent:
                 snippet = "\n".join(lines[s:e])
                 self.visited_files.add(file_path)
                 self.visited_dirs[str(Path(file_path).parent)] += 1
+                # 标记是否读完整个文件
+                is_complete = e >= len(lines)
                 observation = f"文件 {file_path} 第 {start}-{end} 行:\n```cpp\n{snippet}\n```"
+                if is_complete:
+                    observation += f"\n... (已读到文件末尾)"
+                else:
+                    observation += f"\n... (文件共 {len(lines)} 行，未读完)"
                 new_files = [file_path]
 
         elif action == "read_function":
@@ -354,6 +385,10 @@ class ReactAgent:
                 observation = f"找到 {len(callers)} 个调用 '{func_name}' 的位置:\n" + "\n".join(
                     f"- {c['file']}:{c['line']}: {c['content'][:80]}" for c in callers[:10]
                 )
+                # 把找到的文件加入强制读取队列
+                for f in files:
+                    if f not in self.visited_files and f not in self.pending_reads:
+                        self.pending_reads.append(f)
                 new_files = files
 
         elif action == "grep_callees":
@@ -381,7 +416,14 @@ class ReactAgent:
                 new_files = []
             else:
                 files = grep_files(rf"\b{re.escape(symbol)}\b", self.repo_root, limit=10)
+                if not files:
+                    # 记录失败的搜索关键词，用于排除失败方向
+                    self.failed_searches.add(symbol)
                 observation = f"找到 {len(files)} 个文件包含 '{symbol}':\n" + "\n".join(f"- {f}" for f in files)
+                # 把找到的文件加入强制读取队列
+                for f in files:
+                    if f not in self.visited_files and f not in self.pending_reads:
+                        self.pending_reads.append(f)
                 new_files = files
 
         elif action == "finish":
@@ -417,13 +459,31 @@ class ReactAgent:
                 f"- {f} (已读 {c} 次)" for f, c in sorted(self.read_count.items(), key=lambda x: -x[1]) if c > 1
             ) or "(无)"
 
+            # 构建已访问文件及相关性字符串
+            visited_files_with_relevance = "\n".join(
+                f"- {f} ({'相关' if self.file_relevance.get(f) is True else '不相关' if self.file_relevance.get(f) is False else '未知'})"
+                for f in sorted(self.visited_files)
+            ) or "(无)"
+
+            # 从 file_relevance 中获取不相关文件
+            irrelevant_files_str = "\n".join(
+                f"- {f}" for f in sorted(self.visited_files) if self.file_relevance.get(f) is False
+            ) or "(无)"
+
+            # 构建失败搜索关键词字符串
+            failed_searches_str = "\n".join(
+                f"- {s}" for s in sorted(self.failed_searches)
+            ) or "(无)"
+
             prompt = REACT_PROMPT.format(
                 question=question,
                 repo_structure=self.repo_structure,
                 candidate_functions=candidate_functions,
-                visited_files="\n".join(f"- {f}" for f in sorted(self.visited_files)) or "(无)",
+                visited_files_with_relevance=visited_files_with_relevance,
                 visited_dirs=visited_dirs_str,
                 read_count=read_count_str,
+                irrelevant_files=irrelevant_files_str,
+                failed_searches=failed_searches_str,
                 action_history=action_history,
                 max_steps=self.max_steps,
                 current_step=step_num,
@@ -441,6 +501,24 @@ class ReactAgent:
             action_input = decision.get("action_input", {})
             thought = decision.get("thought", "")
             reason = decision.get("reason", "")
+
+            # 记录 LLM 返回的文件相关性
+            file_relevance = decision.get("file_relevance", {})
+            for fp, rel in file_relevance.items():
+                if rel == "相关":
+                    self.file_relevance[fp] = True
+                elif rel == "不相关":
+                    self.file_relevance[fp] = False
+                else:
+                    self.file_relevance[fp] = None
+
+            # 强制机制：如果 pending_reads 非空，下一步必须 read_file 或 read_function
+            if self.pending_reads and action not in ("read_file", "read_function", "finish"):
+                next_file = self.pending_reads.pop(0)
+                action = "read_file"
+                action_input = {"file_path": next_file}
+                thought = f"强制读取 {next_file}（因为上一步 grep_callers/search_symbol 找到了它）"
+                reason = "强制读取找到的文件"
 
             # 防循环：如果 read_file/read_lines/read_function 同一个文件超过 2 次，强制换 search_symbol
             if action in ("read_file", "read_lines", "read_function"):

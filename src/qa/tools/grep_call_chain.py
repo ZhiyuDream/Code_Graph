@@ -41,6 +41,7 @@ def grep_callers(function_name: str, repo_root: Path, limit: int = 10) -> list[d
     """Find locations that call function_name using grep.
 
     Simply grep for "function_name(" and return matching files/lines.
+    Returns list of dicts: {"name": str, "file": str, "line": int, "content": str}
     """
     if not function_name:
         return []
@@ -60,7 +61,17 @@ def grep_callers(function_name: str, repo_root: Path, limit: int = 10) -> list[d
                     # 只排除注释行，不排除定义（定义也是重要信息）
                     if stripped.startswith("//") or stripped.startswith("*"):
                         continue
+                    # 向上回溯，找到调用方函数名
+                    caller_name = ""
+                    for j in range(i - 1, max(-1, i - 20), -1):
+                        prev_line = lines[j].strip()
+                        # 匹配函数定义：ret_type func_name( 或 namespace::func_name(
+                        m = re.match(r"^(?:[\w:<>]+\s+)*?([a-zA-Z_][a-zA-Z0-9_:]*)\s*\([^)]*\)\s*(?:const)?\s*\{?", prev_line)
+                        if m:
+                            caller_name = m.group(1).split("::")[-1]
+                            break
                     callers.append({
+                        "name": caller_name,
                         "file": fp,
                         "line": i,
                         "content": stripped,
