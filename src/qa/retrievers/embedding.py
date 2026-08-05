@@ -84,6 +84,8 @@ class EmbeddingRetriever(BaseRetriever):
                 )
                 sig = rec.get("signature") or ""
                 text = f"Function: {rec['name']}\nFile: {rec['file_path']}\nSignature: {sig}\n\n{code}"
+                # embedding 模型有 8192 token 上限，超长函数截断（约 4 字符/token，留足余量）
+                text = text[:16000]
                 chunks.append({
                     "id": rec["id"],
                     "type": "function",

@@ -99,7 +99,6 @@ def llm_citation_judge(question: str, reference: str, generated: str, gold_files
     prompt = CITATION_JUDGE_PROMPT.format(
         question=question,
         gold_files=gold_text,
-        reference_answer=reference[:2000],
         generated_answer=generated,
     )
     try:
@@ -110,6 +109,7 @@ def llm_citation_judge(question: str, reference: str, generated: str, gold_files
             "cited_files": result.get("cited_files", []),
             "missing_files": result.get("missing_files", []),
             "missing_reasons": result.get("missing_reasons", {}),
+            "evidence_quotes": result.get("evidence_quotes", {}),
             "notes": result.get("notes", ""),
         }
     except Exception as e:
@@ -120,6 +120,57 @@ def llm_citation_judge(question: str, reference: str, generated: str, gold_files
             "missing_reasons": {},
             "notes": f"评估错误: {e}",
         }
+
+
+def deterministic_citation_judge(generated: str, gold_files: list[str], read_files: set) -> dict:
+    """确定性 citation 核对（替代 LLM judge，防幻觉虚报）。
+
+    判定标准（与用户确认）：gold 文件出现在答案文本（含末尾引用清单，
+    全路径或 basename）即算"引用"；但前提是该文件在调查中被实际读过
+    （read_function/read_lines/系统自动读取），否则视为"编造型引用"不计。
+    """
+    import os
+    cited, missing, reasons = [], [], {}
+    for f in gold_files:
+        in_answer = (f in generated) or (os.path.basename(f) in generated)
+        was_read = f in read_files
+        if in_answer and was_read:
+            cited.append(f)
+        else:
+            missing.append(f)
+            if in_answer and not was_read:
+                reasons[f] = "答案引用但从未读过（编造型引用，不计）"
+            elif was_read and not in_answer:
+                reasons[f] = "读过但答案未引用"
+            else:
+                reasons[f] = "未读且未引用"
+    ratio = len(cited) / len(gold_files) if gold_files else 1.0
+    return {
+        "coverage_ratio": ratio,
+        "cited_files": cited,
+        "missing_files": missing,
+        "missing_reasons": reasons,
+        "notes": "确定性核对（读过+答案引用，含引用清单）",
+    }
+
+
+def extract_read_files(result: dict) -> set:
+    """从结果 JSON 提取实际读过的文件集合。
+
+    ReAct 结果：steps 中 read_function/read_lines 的 files_accessed，
+    以及 find_callers/search_symbol 中系统自动读取的文件。
+    Concept-Symbol 结果：retrieved_functions（这些函数被实际读入上下文）。
+    """
+    read = set()
+    for s in result.get("steps", []):
+        if s.get("action") in ("read_function", "read_lines"):
+            read.update(s.get("files_accessed", []))
+        elif s.get("action") in ("find_callers", "search_symbol") and "[系统自动" in s.get("observation", ""):
+            read.update(s.get("files_accessed", []))
+    for fid in result.get("retrieved_functions", []):
+        if isinstance(fid, str) and "/" in fid:
+            read.add(fid.split(":")[0])
+    return read
 
 
 # ── Data loading ────────────────────────────────────────────────────
@@ -145,13 +196,16 @@ def load_split_format(result_path: Path, bench_path: Path, range_str: str) -> li
     else:
         start, end = 0, len(bench_items)
 
+    # 按 qa_id 匹配（子集评估时位置对不上，必须按 id）
+    results_by_id = {r.get("qa_id", r.get("id", "")): r for r in results}
+
     items = []
     for idx in range(start, end):
         bench_item = bench_items[idx]
-        result_idx = idx - start if len(results) == (end - start) else idx
-        if result_idx >= len(results):
+        qa_id = bench_item.get("qa_id", f"q{idx}")
+        result = results_by_id.get(qa_id)
+        if result is None:
             continue
-        result = results[result_idx]
 
         # Deduplicate to file level, exclude .h/.hpp
         gold_files = sorted(set(
@@ -168,6 +222,7 @@ def load_split_format(result_path: Path, bench_path: Path, range_str: str) -> li
             "category": bench_item.get("category", {}).get("level_2", "unknown")
                 if isinstance(bench_item.get("category"), dict) else "unknown",
             "retrieved_functions": result.get("retrieved_functions", []),
+            "_read_files": sorted(extract_read_files(result)),
         })
     return items
 
@@ -210,6 +265,8 @@ def main():
     parser.add_argument("--range", choices=["easy", "hard", "all"], default="easy")
     parser.add_argument("--mode", choices=["binary", "citation", "all"], default="all",
                         help="评估模式: binary=仅二元判断, citation=仅引用覆盖, all=两者")
+    parser.add_argument("--citation-mode", choices=["llm", "det", "both"], default="llm",
+                        help="citation 判定方式: llm=LLM judge(可能幻觉虚报), det=确定性核对(读过+答案引用), both=两者都算")
     parser.add_argument("--model", type=str, default=None,
                         help="Judge model name (默认: 优先 LLM_MODEL 环境变量，否则 gpt-4.1-mini)")
     parser.add_argument("-o", "--output", type=Path, required=True)
@@ -244,10 +301,19 @@ def main():
 
         # Citation judge
         if args.mode in ("citation", "all"):
-            cit = llm_citation_judge(
-                item["question"], item["reference"], item["generated"], item.get("gold_files", [])
-            )
-            item["eval_citation"] = cit
+            if args.citation_mode in ("llm", "both"):
+                cit = llm_citation_judge(
+                    item["question"], item["reference"], item["generated"], item.get("gold_files", [])
+                )
+                item["eval_citation"] = cit
+            if args.citation_mode in ("det", "both"):
+                det = deterministic_citation_judge(
+                    item["generated"], item.get("gold_files", []), set(item.get("_read_files", []))
+                )
+                if args.citation_mode == "both":
+                    item["eval_citation_det"] = det
+                else:
+                    item["eval_citation"] = det
 
         completed += 1
         if completed % 5 == 0:

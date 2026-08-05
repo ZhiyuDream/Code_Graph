@@ -191,15 +191,23 @@ def read_function(
                 # 注意：多行函数定义的签名可能以逗号结尾，不能简单排除逗号结尾
                 if stripped.endswith(";") and "{" not in stripped:
                     continue
-                # 优先选择看起来像函数定义的：行首是 static/void/int/bool/auto/template 等
+                # 优先选择看起来像函数定义的：行首是 C/C++ 类型/修饰符关键字，
+                # 或行内（或下一行）带 { —— 均为语言级特征，不依赖具体仓库的命名习惯
                 if stripped.startswith((
                     "static ", "void ", "int ", "bool ", "auto ",
-                    "template ", "inline ", "constexpr ", "extern ",
-                    "std::", "string ", "char ", "float ", "double ",
-                    "common_", "llama_", "ggml_",
+                    "template ", "inline ", "constexpr ", "extern ", "virtual ",
+                    "std::", "string ", "char ", "float ", "double ", "struct ", "class ",
                 )):
                     start_idx = i
                     break
+                # 通用定义特征：行尾是 { 或下一非空行以 { 开头（且当前行不是控制语句/调用）
+                if (stripped.endswith("{") or stripped.endswith(")") or stripped.endswith(",")) and not stripped.startswith(
+                    ("if ", "if(", "for ", "for(", "while ", "while(", "switch ", "switch(", "return ", "catch ")
+                ):
+                    nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                    if stripped.endswith("{") or nxt.startswith("{"):
+                        start_idx = i
+                        break
                 # 如果没有匹配到定义特征，先记录下来作为备选
                 if start_idx is None:
                     start_idx = i
