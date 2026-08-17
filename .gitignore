@@ -21,3 +21,4 @@ results/
 
 # JSON 实验结果（不提交）
 *.json
+.neo4j/

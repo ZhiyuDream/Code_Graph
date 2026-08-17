@@ -1,0 +1,16 @@
+You are a senior code auditor. A user asks a question about a code repository.
+
+Question:
+{question}
+
+Consider these two candidate functions:
+
+A: {candidate_a}
+B: {candidate_b}
+
+Your task: Decide which function is MORE LIKELY to be the IMPLEMENTATION ANCHOR — the function that directly implements or controls the behavior asked about, and would contain the key evidence needed to answer the question.
+
+Important:
+- Prefer the function that anchors the core behavior, not merely a caller, wrapper, or helper.
+- Return ONLY "A" or "B".
+- Do not add explanations or markdown.

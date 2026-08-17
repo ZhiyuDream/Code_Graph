@@ -2,7 +2,7 @@
 Neo4j 批量写入器：使用 UNWIND 批量写入节点和边。
 
 改进点（相比原 neo4j_writer.py）：
-1. 使用 UNWIND 批量写入，每批 500 条
+1. 使用 UNWIND 批量写入，每批默认 5000 条
 2. 节点和边分别批量
 3. 事务管理：session.execute_write()
 4. 边写入带标签限定，命中索引加速
@@ -15,7 +15,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 500
+BATCH_SIZE = 5000
 
 
 def ensure_constraints(driver, database: str):
@@ -32,23 +32,32 @@ def ensure_constraints(driver, database: str):
 
 
 def clear_code_graph(driver, database: str):
-    """删除代码图相关节点（保留 Issue/PullRequest）。"""
+    """Delete code graph nodes using Neo4j subtransactions."""
     labels = ["Variable", "Function", "Class", "Attribute", "ControlFlowBlock", "ResourceOperation", "ExternalCall", "AmbiguousCall", "File", "Directory", "Repository", "Module"]
+    batch_size = 1000
     with driver.session(database=database) as session:
         for label in labels:
-            session.run(f"MATCH (n:{label}) DETACH DELETE n")
+            while True:
+                before = session.run(f"MATCH (n:{label}) RETURN count(n) AS count").single()["count"]
+                if not before:
+                    break
+                session.run(
+                    f"CALL {{ MATCH (n:{label}) WITH n LIMIT {batch_size} DETACH DELETE n }} IN TRANSACTIONS OF {batch_size} ROWS"
+                ).consume()
+                after = session.run(f"MATCH (n:{label}) RETURN count(n) AS count").single()["count"]
+                logger.info("Deleted %d %s nodes", before - after, label)
 
 
-def _batch_write_nodes(session, label: str, nodes: list[dict[str, Any]]):
+def _batch_write_nodes(session, label: str, nodes: list[dict[str, Any]], batch_size: int = BATCH_SIZE, merge: bool = True):
     """批量写入同一标签的节点。"""
     if not nodes:
         return
-    for i in range(0, len(nodes), BATCH_SIZE):
-        batch = nodes[i : i + BATCH_SIZE]
+    for i in range(0, len(nodes), batch_size):
+        batch = nodes[i : i + batch_size]
         session.run(
             f"""
             UNWIND $batch AS node
-            MERGE (n:{label} {{id: node.id}})
+            {"MERGE" if merge else "CREATE"} (n:{label} {{id: node.id}})
             SET n += node
             """,
             batch=batch,
@@ -61,6 +70,8 @@ def _batch_write_edges(
     rel_type: str,
     edges: list[tuple[str, str, dict]],
     id_to_label: dict[str, str],
+    batch_size: int = BATCH_SIZE,
+    merge: bool = True,
 ):
     """批量写入同一类型的边，按节点标签分组以命中索引。"""
     if not edges:
@@ -81,8 +92,8 @@ def _batch_write_edges(
         logger.debug("Skipped %d %s edges with missing node labels", skipped, rel_type)
 
     for (from_label, to_label), batch_edges in groups.items():
-        for i in range(0, len(batch_edges), BATCH_SIZE):
-            batch = batch_edges[i : i + BATCH_SIZE]
+        for i in range(0, len(batch_edges), batch_size):
+            batch = batch_edges[i : i + batch_size]
             batch_dicts = [
                 {"from_id": from_id, "to_id": to_id, "props": props}
                 for from_id, to_id, props in batch
@@ -92,7 +103,7 @@ def _batch_write_edges(
                 UNWIND $batch AS edge
                 MATCH (a:{from_label}) WHERE a.id = edge.from_id
                 MATCH (b:{to_label}) WHERE b.id = edge.to_id
-                MERGE (a)-[r:{rel_type}]->(b)
+                {"MERGE" if merge else "CREATE"} (a)-[r:{rel_type}]->(b)
                 SET r += edge.props
                 """,
                 batch=batch_dicts,
@@ -102,7 +113,13 @@ def _batch_write_edges(
             )
 
 
-def write_graph(driver, graph: dict[str, Any], database: str):
+def write_graph(
+    driver,
+    graph: dict[str, Any],
+    database: str,
+    batch_size: int = BATCH_SIZE,
+    merge: bool = True,
+):
     """
     批量写入图到 Neo4j。
 
@@ -123,11 +140,11 @@ def write_graph(driver, graph: dict[str, Any], database: str):
     with driver.session(database=database) as session:
         # 写入节点（按标签分组）
         for label in ["Repository", "Directory", "File", "Function", "Class", "Variable", "Attribute", "Module", "ControlFlowBlock", "ResourceOperation", "ExternalCall", "AmbiguousCall"]:
-            _batch_write_nodes(session, label, nodes.get(label, []))
+            _batch_write_nodes(session, label, nodes.get(label, []), batch_size=batch_size, merge=merge)
 
         # 写入边（按关系类型分组，内部按标签再分）
         for rel_type in ["CONTAINS", "CALLS", "CALLS_AMBIGUOUS", "REFERENCES_VAR", "HAS_MEMBER", "HAS_METHOD", "BELONGS_TO", "MODULE_CALLS", "EXTERNAL_CALLS", "CONTROL_FLOW", "MANAGES"]:
-            _batch_write_edges(session, rel_type, edges.get(rel_type, []), id_to_label)
+            _batch_write_edges(session, rel_type, edges.get(rel_type, []), id_to_label, batch_size=batch_size, merge=merge)
 
     total_nodes = sum(len(v) for v in nodes.values())
     total_edges = sum(len(v) for v in edges.values())

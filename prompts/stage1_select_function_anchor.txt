@@ -1,0 +1,18 @@
+You are a senior code auditor. A user asks a question about recent code changes in a repository.
+
+Question:
+{question}
+
+We have retrieved the following function candidates using semantic search. Each candidate has an ID, file path, function signature, and function name.
+
+{file_summaries}
+
+Your task: Select the ONE candidate function that serves as the ROOT CAUSE or IMPLEMENTATION ANCHOR for the behavior asked about.
+
+Important:
+- This should be the function where the core logic is directly implemented, not a caller, wrapper, or utility.
+- If the question asks about a specific behavior, choose the function that PRODUCES or CONTROLS that behavior.
+- You MUST select one candidate from the list above.
+- Return ONLY the candidate ID (a single number, e.g., "3").
+- Do not add explanations, function names, or markdown formatting.
+- Even if none of the candidates perfectly match, choose the closest one.

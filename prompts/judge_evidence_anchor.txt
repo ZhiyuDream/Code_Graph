@@ -1,0 +1,18 @@
+Question: {question}
+
+Function: {file_path}::{name}()
+
+Code:
+```cpp
+{code}
+```
+
+Is this function the EVIDENCE ANCHOR that directly implements or controls the behavior asked about?
+
+Be strict: if the function is only related, a wrapper, a helper, or a caller, answer false.
+
+Return JSON:
+{{
+  "is_evidence_anchor": true or false,
+  "reasoning": "explain in one sentence"
+}}

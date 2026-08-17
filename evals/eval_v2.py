@@ -5,100 +5,70 @@
 1. 旧格式（单文件）：--input results/v2.json
 2. 新格式（分离）：--result results/benchmark.json --benchmark datasets/bench.json --range easy|hard
 
+Judge LLM 通过 --model 指定，统一走 src/core/llm_client.py，默认 gpt-4.1-mini。
+
 用法示例：
-    # Easy benchmark 评估
-    python evals/eval_v2.py --result results/benchmark_symbol_fastpath_20260607_131010.json \
-        --benchmark datasets/posthoc_audit_benchmark_v2.json --range easy \
-        -o results/easy_eval.json -w 20
+    # 默认 judge：gpt-4.1-mini
+    python evals/eval_v2.py --result results/qa.json --benchmark datasets/benchmark_hard.json \
+        --range all -o results/eval.json -w 20
 
-    # Hard benchmark 评估
-    python evals/eval_v2.py --result results/benchmark_hard_20260607_200601.json \
-        --benchmark datasets/benchmark_hard.json --range all \
-        -o results/hard_eval.json -w 20
-
-    # 旧格式单文件评估
-    python evals/eval_v2.py --input results/v2_deepseek_fullfiles.json \
-        -o results/v2_deepseek_fullfiles.eval.json -w 20
+    # 指定 glm-5.2 作为 judge（.env 中 OPENAI_BASE_URL 需指向兼容中转站）
+    python evals/eval_v2.py --result results/qa.json --benchmark datasets/benchmark_hard.json \
+        --range all --model glm-5.2 -o results/eval_glm52.json -w 20
 """
 import json
 import sys
 import os
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL
-from openai import OpenAI
+from src.core.llm_client import call_llm, call_llm_json
 
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
-JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gpt-4.1-mini")
 
-# ── Prompts ─────────────────────────────────────────────────────────
+def load_prompt(name: str) -> str:
+    """从 prompts/ 目录加载 prompt 模板。"""
+    path = _ROOT / "prompts" / f"{name}.txt"
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
-BINARY_JUDGE_PROMPT = """请判断「生成答案」是否正确回答了问题。
 
-判断标准：
-- 正确 (CORRECT): 生成答案准确回答了问题，核心信息正确，无重大错误
-- 错误 (INCORRECT): 生成答案与问题无关、信息错误、或未回答问题
+# 当前使用的 judge 模型，由命令行 --model 指定；默认从环境 LLM_MODEL 读取，未设置则回退 gpt-4.1-mini。
+_judge_model: str | None = None
 
-必须首行输出：结果: CORRECT 或 结果: INCORRECT
-第二行起：简要说明理由（1-2句话）
 
-【问题】
-{question}
+def init_judge(model: str | None = None):
+    """初始化 judge 模型名称。"""
+    global _judge_model
+    _judge_model = model
 
-【参考答案】
-{reference}
 
-【生成答案】
-{generated}
-"""
-
-CITATION_JUDGE_PROMPT = """你是一位严格的代码审查评估专家。请评估 AI 生成答案是否覆盖了给定的 gold evidence 文件。
-
-【评估规则】
-1. 只看 .cpp / .c 文件，忽略 .h / .hpp 头文件
-2. 如果 gold evidence 中多个条目指向同一文件的不同行号，只要答案引用了该文件（无论行号是否精确匹配），就算覆盖
-3. "引用"的定义：答案正文中明确提到该文件路径（如 `common/arg.cpp` 或 `common/arg.cpp:123`），且将其作为分析证据使用
-4. 如果答案只是顺带提到文件名但没有分析其内容，不算"引用"
-
-【原始问题】
-{question}
-
-【Gold Evidence（需要被覆盖的文件，已排除 .h/.hpp）】
-{gold_files}
-
-【参考答案】
-{reference_answer}
-
-【生成答案】
-{generated_answer}
-
----
-
-请判断生成答案的引用覆盖情况：
-
-1. 对于每个 gold 文件，判断是否被生成答案引用
-2. 计算覆盖率 = 被引用的 gold 文件数 / 总 gold 文件数
-3. 对于未被引用的文件，分析原因：
-   - "检索失败"：答案中完全没有提到该文件
-   - "搜到未引"：答案中提到了该文件但没有作为核心证据分析
-   - "不需要"：该文件对回答问题不是必需的
-
-返回 JSON：
-{{
-  "coverage_ratio": 0.0,
-  "cited_files": ["file1.cpp", "file2.cpp"],
-  "missing_files": ["file3.cpp"],
-  "missing_reasons": {{"file3.cpp": "检索失败|搜到未引|不需要"}},
-  "notes": "简短说明"
-}}
-"""
+def call_judge(prompt: str, json_mode: bool = False, max_tokens: int = 800) -> str:
+    """调用 judge LLM，统一走 call_llm / call_llm_json。"""
+    if json_mode:
+        result = call_llm_json(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            model=_judge_model,
+        )
+        if result is None:
+            return "{}"
+        return json.dumps(result, ensure_ascii=False)
+    return call_llm(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        model=_judge_model,
+    )
 
 
 # ── Core functions ──────────────────────────────────────────────────
+
+BINARY_JUDGE_PROMPT = load_prompt("binary_judge")
+CITATION_JUDGE_PROMPT = load_prompt("citation_judge")
+
 
 def llm_binary_judge(question: str, reference: str, generated: str) -> tuple[bool, str]:
     prompt = BINARY_JUDGE_PROMPT.format(
@@ -107,13 +77,7 @@ def llm_binary_judge(question: str, reference: str, generated: str) -> tuple[boo
         generated=generated[:1500]
     )
     try:
-        resp = client.chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=200
-        )
-        text = resp.choices[0].message.content.strip()
+        text = call_judge(prompt, json_mode=False, max_tokens=200)
         first_line = text.split('\n')[0].upper()
         is_correct = "CORRECT" in first_line and "INCORRECT" not in first_line
         return is_correct, text
@@ -135,24 +99,17 @@ def llm_citation_judge(question: str, reference: str, generated: str, gold_files
     prompt = CITATION_JUDGE_PROMPT.format(
         question=question,
         gold_files=gold_text,
-        reference_answer=reference[:2000],
         generated_answer=generated,
     )
     try:
-        resp = client.chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=800,
-            response_format={"type": "json_object"},
-        )
-        text = resp.choices[0].message.content.strip()
+        text = call_judge(prompt, json_mode=True, max_tokens=4000)  # reasoning judge 需要更大预算,否则截断成空判
         result = json.loads(text)
         return {
             "coverage_ratio": float(result.get("coverage_ratio", 0)),
             "cited_files": result.get("cited_files", []),
             "missing_files": result.get("missing_files", []),
             "missing_reasons": result.get("missing_reasons", {}),
+            "evidence_quotes": result.get("evidence_quotes", {}),
             "notes": result.get("notes", ""),
         }
     except Exception as e:
@@ -163,6 +120,64 @@ def llm_citation_judge(question: str, reference: str, generated: str, gold_files
             "missing_reasons": {},
             "notes": f"评估错误: {e}",
         }
+
+
+def deterministic_citation_judge(generated: str, gold_files: list[str], read_files: set) -> dict:
+    """确定性 citation 核对（替代 LLM judge，防幻觉虚报）。
+
+    判定标准（与用户确认）：gold 文件出现在答案文本（含末尾引用清单，
+    全路径或 basename）即算"引用"；但前提是该文件在调查中被实际读过
+    （read_function/read_lines/系统自动读取），否则视为"编造型引用"不计。
+
+    basename 匹配加路径/命名字符边界：`common.cpp` 不应命中 `server-common.cpp`
+    （012 案例：子串误配把没读过的文件算成"引用过"）。
+    """
+    import os
+    import re
+    cited, missing, reasons = [], [], {}
+    for f in gold_files:
+        base = os.path.basename(f)
+        in_answer = (f in generated) or bool(
+            re.search(r"(?<![A-Za-z0-9_\-.])" + re.escape(base) + r"(?![A-Za-z0-9_])", generated)
+        )
+        was_read = f in read_files
+        if in_answer and was_read:
+            cited.append(f)
+        else:
+            missing.append(f)
+            if in_answer and not was_read:
+                reasons[f] = "答案引用但从未读过（编造型引用，不计）"
+            elif was_read and not in_answer:
+                reasons[f] = "读过但答案未引用"
+            else:
+                reasons[f] = "未读且未引用"
+    ratio = len(cited) / len(gold_files) if gold_files else 1.0
+    return {
+        "coverage_ratio": ratio,
+        "cited_files": cited,
+        "missing_files": missing,
+        "missing_reasons": reasons,
+        "notes": "确定性核对（读过+答案引用，含引用清单）",
+    }
+
+
+def extract_read_files(result: dict) -> set:
+    """从结果 JSON 提取实际读过的文件集合。
+
+    ReAct 结果：steps 中 read_function/read_lines 的 files_accessed，
+    以及 find_callers/search_symbol 中系统自动读取的文件。
+    Concept-Symbol 结果：retrieved_functions（这些函数被实际读入上下文）。
+    """
+    read = set()
+    for s in result.get("steps", []):
+        if s.get("action") in ("read_function", "read_lines"):
+            read.update(s.get("files_accessed", []))
+        elif s.get("action") in ("find_callers", "search_symbol") and "[系统自动" in s.get("observation", ""):
+            read.update(s.get("files_accessed", []))
+    for fid in result.get("retrieved_functions", []):
+        if isinstance(fid, str) and "/" in fid:
+            read.add(fid.split(":")[0])
+    return read
 
 
 # ── Data loading ────────────────────────────────────────────────────
@@ -188,13 +203,16 @@ def load_split_format(result_path: Path, bench_path: Path, range_str: str) -> li
     else:
         start, end = 0, len(bench_items)
 
+    # 按 qa_id 匹配（子集评估时位置对不上，必须按 id）
+    results_by_id = {r.get("qa_id", r.get("id", "")): r for r in results}
+
     items = []
     for idx in range(start, end):
         bench_item = bench_items[idx]
-        result_idx = idx - start if len(results) == (end - start) else idx
-        if result_idx >= len(results):
+        qa_id = bench_item.get("qa_id", f"q{idx}")
+        result = results_by_id.get(qa_id)
+        if result is None:
             continue
-        result = results[result_idx]
 
         # Deduplicate to file level, exclude .h/.hpp
         gold_files = sorted(set(
@@ -211,6 +229,7 @@ def load_split_format(result_path: Path, bench_path: Path, range_str: str) -> li
             "category": bench_item.get("category", {}).get("level_2", "unknown")
                 if isinstance(bench_item.get("category"), dict) else "unknown",
             "retrieved_functions": result.get("retrieved_functions", []),
+            "_read_files": sorted(extract_read_files(result)),
         })
     return items
 
@@ -253,9 +272,16 @@ def main():
     parser.add_argument("--range", choices=["easy", "hard", "all"], default="easy")
     parser.add_argument("--mode", choices=["binary", "citation", "all"], default="all",
                         help="评估模式: binary=仅二元判断, citation=仅引用覆盖, all=两者")
+    parser.add_argument("--citation-mode", choices=["llm", "det", "both"], default="llm",
+                        help="citation 判定方式: llm=LLM judge(可能幻觉虚报), det=确定性核对(读过+答案引用), both=两者都算")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Judge model name (默认: 优先 LLM_MODEL 环境变量，否则 gpt-4.1-mini)")
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("-w", "--workers", type=int, default=20)
     args = parser.parse_args()
+
+    judge_model = args.model or os.environ.get("LLM_MODEL") or "gpt-4.1-mini"
+    init_judge(judge_model)
 
     # Load data
     if args.input:
@@ -265,7 +291,7 @@ def main():
     else:
         parser.error("请提供 --input 或 (--result + --benchmark)")
 
-    print(f"加载 {len(items)} 题，模型: {JUDGE_MODEL}, workers: {args.workers}, mode: {args.mode}")
+    print(f"加载 {len(items)} 题，judge model: {_judge_model}, workers: {args.workers}, mode: {args.mode}")
 
     # Run evaluation
     completed = 0
@@ -282,10 +308,19 @@ def main():
 
         # Citation judge
         if args.mode in ("citation", "all"):
-            cit = llm_citation_judge(
-                item["question"], item["reference"], item["generated"], item.get("gold_files", [])
-            )
-            item["eval_citation"] = cit
+            if args.citation_mode in ("llm", "both"):
+                cit = llm_citation_judge(
+                    item["question"], item["reference"], item["generated"], item.get("gold_files", [])
+                )
+                item["eval_citation"] = cit
+            if args.citation_mode in ("det", "both"):
+                det = deterministic_citation_judge(
+                    item["generated"], item.get("gold_files", []), set(item.get("_read_files", []))
+                )
+                if args.citation_mode == "both":
+                    item["eval_citation_det"] = det
+                else:
+                    item["eval_citation"] = det
 
         completed += 1
         if completed % 5 == 0:

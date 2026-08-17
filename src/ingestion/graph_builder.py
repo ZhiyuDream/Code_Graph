@@ -456,19 +456,10 @@ def _build_module_nodes(
             else:
                 G.add_edge(caller_id, callee_id, weight=1.0)
 
-    file_funcs: dict[str, list[str]] = {}
-    for f in functions:
-        file_funcs.setdefault(f.get("file_path", ""), []).append(f["id"])
-    for fp, fids in file_funcs.items():
-        if len(fids) < 2:
-            continue
-        for i in range(len(fids)):
-            for j in range(i + 1, len(fids)):
-                a, b = fids[i], fids[j]
-                if G.has_edge(a, b):
-                    G[a][b]["weight"] += 0.5
-                else:
-                    G.add_edge(a, b, weight=0.5)
+    # Do not create an all-pairs same-file clique here.  A file with N
+    # functions would otherwise add O(N^2) artificial edges and dominate both
+    # memory use and Louvain runtime.  File -> Function CONTAINS edges already
+    # preserve this structural relationship in the main graph.
 
     if G.number_of_nodes() < 10 or G.number_of_edges() < 5:
         logger.info("Module detection skipped: graph too small (%d nodes, %d edges)",

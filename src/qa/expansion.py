@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from .models import RetrievedFunction, ExpandLevel
-from .tools.file_reader import read_function, extract_signature, read_full_file
+from src.search.code_reader import read_function_from_file, extract_signature, read_full_file
 from .tools.class_reader import expand_class
 
 
@@ -85,7 +85,7 @@ class CodeExpander:
         # 条件：必须有准确的 start_line + end_line（来自 Neo4j / embedding index）
         # 没有 end_line 的情况通常是 grep 单行匹配，其 content 已作为 body 保留
         if level.value >= ExpandLevel.BODY.value and func.file_path and func.start_line and func.end_line:
-            code = read_function(func.file_path, func.start_line, func.end_line)
+            code = read_function_from_file(func.file_path, func.name, func.start_line, func.end_line)
             if code:
                 func.body = code
                 if not func.signature:

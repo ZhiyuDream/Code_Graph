@@ -1,0 +1,18 @@
+You are a senior code auditor. A user asks a question about recent code changes in a repository.
+
+Question:
+{question}
+
+We have retrieved the following function candidates using semantic search. Each candidate has an ID, file path, function signature, and function name.
+
+{file_summaries}
+
+Your task: Select the ONE candidate function that is MOST LIKELY TO CONTAIN THE EVIDENCE needed to answer the question.
+
+Important:
+- Prefer the function that IMPLEMENTS or ANCHORS the behavior, not one that merely describes or wraps it.
+- Avoid generic API entry points, helper functions, or thin wrappers unless they themselves contain the key evidence.
+- You MUST select one candidate from the list above.
+- Return ONLY the candidate ID (a single number, e.g., "3").
+- Do not add explanations, function names, or markdown formatting.
+- Even if none of the candidates perfectly match, choose the closest one.

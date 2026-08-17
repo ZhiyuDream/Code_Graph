@@ -6,7 +6,7 @@ import numpy as np
 from typing import List, Dict
 from pathlib import Path
 
-from ..core.llm_client import get_llm_client
+from ..core.embedding_client import get_encoder
 from .code_reader import enrich_function_with_code
 from .frequency_penalty import apply_penalty, DEFAULT_PENALTY
 
@@ -27,12 +27,8 @@ def _load_rag_index() -> dict | None:
 
 def get_embedding(text: str) -> list[float]:
     """获取文本的embedding向量"""
-    client = get_llm_client()
-    resp = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=text[:8000]
-    )
-    return resp.data[0].embedding
+    encoder = get_encoder(model=EMBEDDING_MODEL)
+    return encoder.encode_single(text).tolist()
 
 
 def cosine_similarity(v1: list[float], v2: list[float]) -> float:

@@ -262,6 +262,55 @@ def read_file_lines(file_path: str, start_line: int, end_line: int) -> str:
         return f"// 读取文件失败: {e}"
 
 
+def extract_signature(lines: list[str], func_name: str) -> str:
+    """从代码行列表中提取函数签名"""
+    if not lines:
+        return ""
+    for i, line in enumerate(lines):
+        if func_name in line and "(" in line:
+            start = max(0, i - 10)
+            sig_lines = []
+            for j in range(start, i + 1):
+                l = lines[j].rstrip("\n")
+                if l.strip() or j == i:
+                    sig_lines.append(l)
+            sig = " ".join(l.strip() for l in sig_lines)
+            if "{" in sig:
+                sig = sig[:sig.index("{")]
+            if ";" in sig and "(" in sig and sig.index(";") > sig.index("("):
+                sig = sig[:sig.index(";")]
+            return sig.strip()
+    return lines[0].strip() if lines else ""
+
+
+def find_class_bounds(lines: list[str], class_name: str) -> tuple[int, int]:
+    """在文件中找到类的起止行号（0-based）"""
+    start_idx = -1
+    class_pattern = re.compile(
+        rf"^(?:\s*template\s*<[^>]+>\s*)?(?:\s*class|struct)\s+{re.escape(class_name)}\b"
+    )
+    for i, line in enumerate(lines):
+        if class_pattern.search(line):
+            start_idx = i
+            break
+
+    if start_idx < 0:
+        return -1, -1
+
+    brace_count = 0
+    in_class = False
+    for i in range(start_idx, len(lines)):
+        for ch in lines[i]:
+            if ch == "{":
+                brace_count += 1
+                in_class = True
+            elif ch == "}":
+                brace_count -= 1
+                if in_class and brace_count == 0:
+                    return start_idx, i + 1
+    return start_idx, len(lines)
+
+
 def batch_enrich_functions(functions: list) -> list:
     """批量为函数列表补充代码"""
     return [enrich_function_with_code(f) for f in functions]

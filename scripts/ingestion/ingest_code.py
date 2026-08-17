@@ -1,57 +1,36 @@
 #!/usr/bin/env python3
+"""Tree-sitter-only full ingestion entrypoint."""
 from __future__ import annotations
-
-"""
-代码全量摄取（clangd LSP → Neo4j）。
-
-基于 src/ingestion/ 的新实现。
-
-改进点：
-- callee_line 精确匹配重载函数
-- kind=8 (Field) 正确归类为 member
-- 异常向上传播，不再静默吞掉
-- 两阶段变量引用，消除时序盲区
-- AMBIGUOUS 边用于诊断
-- UNWIND 批量写入 Neo4j
-- 头文件纳入解析范围
-"""
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
-# scripts/ingestion/ingest_code.py -> parent.parent = scripts/ -> parent.parent.parent = Code_Graph/
 _CODE_GRAPH = Path(__file__).resolve().parent.parent.parent
 if str(_CODE_GRAPH) not in sys.path:
     sys.path.insert(0, str(_CODE_GRAPH))
 
-from config import get_compile_commands_path, get_repo_root, NEO4J_DATABASE
+from config import get_repo_root, NEO4J_DATABASE
 from src.neo4j_writer import get_driver, get_head_commit, update_repository_commit
-from src.ingestion.neo4j_writer import ensure_constraints, clear_code_graph
-from src.ingestion.orchestrator import run_full_pipeline
+from src.ingestion.tree_sitter_pipeline import run_tree_sitter_pipeline
 
 
 def setup_logging() -> None:
-    handlers = [
-        logging.StreamHandler(),
-        logging.FileHandler("/tmp/ingestion_a6cc43c_v5.log", mode="w", encoding="utf-8"),
-    ]
+    log_dir = _CODE_GRAPH / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"ingestion_treesitter_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=handlers,
+        handlers=[logging.StreamHandler(), logging.FileHandler(log_path, mode="w", encoding="utf-8")],
     )
+    print(f"Logging to: {log_path}")
 
 
 def main() -> int:
     setup_logging()
     logger = logging.getLogger("ingest_code")
-
-    build_dir = get_compile_commands_path()
-    if not build_dir:
-        logger.error("compile_commands.json not found. Set REPO_ROOT or COMPILE_COMMANDS_DIR.")
-        return 1
-
     repo_root = get_repo_root()
     if not repo_root:
         logger.error("REPO_ROOT not set.")
@@ -60,55 +39,35 @@ def main() -> int:
     driver = get_driver()
     try:
         driver.verify_connectivity()
-    except Exception as e:
-        logger.error("Neo4j connection failed: %s", e)
-        return 1
-
-    try:
-        stats = run_full_pipeline(
+        stats = run_tree_sitter_pipeline(
             repo_root=repo_root,
-            compile_commands_dir=build_dir,
             driver=driver,
             database=NEO4J_DATABASE,
-            collect_calls=True,
-            collect_var_refs=False,
-            include_dirs=None,
+            batch_size=5000,
+            clear_existing=True,
         )
-    except Exception as e:
-        logger.error("Pipeline failed: %s", e)
-        return 1
-    finally:
-        driver.close()
-
-    # 更新 commit
-    driver = get_driver()
-    try:
         sha = get_head_commit(repo_root)
         if sha:
             with driver.session(database=NEO4J_DATABASE) as session:
-                result = session.run("MATCH (r:Repository) RETURN r.id AS id LIMIT 1")
-                record = result.single()
+                record = session.run(
+                    "MATCH (r:Repository) RETURN r.id AS id LIMIT 1"
+                ).single()
                 if record:
                     update_repository_commit(driver, record["id"], sha, NEO4J_DATABASE)
-                    logger.info("Updated last_processed_commit = %s", sha[:8])
+        logger.info(
+            "Tree-sitter-only ingestion complete: files=%d functions=%d classes=%d calls_candidate=%d",
+            stats.get("files_parsed", 0),
+            stats.get("functions", 0),
+            stats.get("classes", 0),
+            stats.get("neo4j_calls_candidate_submitted", 0),
+        )
+        return 0
+    except Exception as exc:
+        logger.exception("Tree-sitter-only pipeline failed: %s", exc)
+        return 1
     finally:
         driver.close()
 
-    logger.info(
-        "=== Stage 1 v2 Complete ===\n"
-        "  Files: %(files)d\n"
-        "  Functions: %(functions)d\n"
-        "  Classes: %(classes)d\n"
-        "  Variables: %(variables)d\n"
-        "  Attributes: %(attributes)d\n"
-        "  CALLS: %(calls)d\n"
-        "  AMBIGUOUS: %(ambiguous)d\n"
-        "  UNRESOLVED: %(unresolved)d\n"
-        "  Elapsed: %(elapsed_total).1fs",
-        stats,
-    )
-    return 0
-
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
