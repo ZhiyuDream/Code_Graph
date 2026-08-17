@@ -1,0 +1,4 @@
+以下是一个 C++ 仓库的代码审计中文问题。请推测仓库代码中可能出现的英文函数名/变量名/关键词标识符（ snake_case 或 CamelCase，如 parse_config、init_backend、handle_request 风格）。
+只输出 JSON，格式：{{"keywords": ["..."]}}，最多 8 个，不要解释。
+
+问题：{question}

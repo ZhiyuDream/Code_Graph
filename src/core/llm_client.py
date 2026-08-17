@@ -232,7 +232,11 @@ def call_llm_json(
 
         # 2. 标准 JSON 解析
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
+            # 只接受 dict：LLM 偶尔把答案包成数组/字符串，
+            # json.loads 能解析成功但上层（监督者/决策）拿到非 dict 会静默丢弃
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 

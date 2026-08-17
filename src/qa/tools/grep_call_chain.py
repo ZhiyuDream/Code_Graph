@@ -179,8 +179,9 @@ def read_function(
             lines = f.readlines()
 
         # 查找函数定义行：更宽松的匹配
+        # 用负向后行断言代替 \b：析构函数（~xxx）、operator== 等非单词字符开头的名字 \b 永远匹配不到
         start_idx = None
-        pattern = rf"\b{re.escape(function_name)}\s*\("
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(function_name)}\s*\("
         for i, line in enumerate(lines):
             if re.search(pattern, line):
                 stripped = line.strip()
@@ -213,6 +214,32 @@ def read_function(
                     start_idx = i
 
         if start_idx is None:
+            # Neo4j 行号表兜底：正则扫描找不到时（析构函数、宏内定义、特殊命名），
+            # 用 tree-sitter 解析出的精确行号直接切区间（001/034 案例：~dtor 读不到导致死锁）
+            try:
+                from src.core.neo4j_client import run_cypher
+                rows = run_cypher(
+                    "MATCH (f:Function {file_path: $fp}) "
+                    "WHERE f.name = $name OR f.name ENDS WITH $suffix "
+                    "RETURN f.name AS name, f.start_line AS start, f.end_line AS end "
+                    "ORDER BY f.start_line LIMIT 1",
+                    {"fp": file_path, "name": function_name,
+                     "suffix": "::" + function_name.split("::")[-1]},
+                )
+            except Exception:
+                rows = []
+            if rows and rows[0].get("start") and rows[0].get("end"):
+                s, e = rows[0]["start"], rows[0]["end"]
+                code = "".join(lines[s - 1:e])
+                if max_chars > 0 and len(code) > max_chars:
+                    code = code[:max_chars] + "\n... (truncated)"
+                return {
+                    "name": rows[0]["name"] or function_name,
+                    "file": file_path,
+                    "start_line": s,
+                    "end_line": e,
+                    "code": code,
+                }
             return {"name": function_name, "file": file_path, "error": "function not found in this file"}
 
         # 向前回溯，找到函数签名的真正开始（处理多行签名和模板）

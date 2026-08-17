@@ -128,11 +128,18 @@ def deterministic_citation_judge(generated: str, gold_files: list[str], read_fil
     判定标准（与用户确认）：gold 文件出现在答案文本（含末尾引用清单，
     全路径或 basename）即算"引用"；但前提是该文件在调查中被实际读过
     （read_function/read_lines/系统自动读取），否则视为"编造型引用"不计。
+
+    basename 匹配加路径/命名字符边界：`common.cpp` 不应命中 `server-common.cpp`
+    （012 案例：子串误配把没读过的文件算成"引用过"）。
     """
     import os
+    import re
     cited, missing, reasons = [], [], {}
     for f in gold_files:
-        in_answer = (f in generated) or (os.path.basename(f) in generated)
+        base = os.path.basename(f)
+        in_answer = (f in generated) or bool(
+            re.search(r"(?<![A-Za-z0-9_\-.])" + re.escape(base) + r"(?![A-Za-z0-9_])", generated)
+        )
         was_read = f in read_files
         if in_answer and was_read:
             cited.append(f)

@@ -126,16 +126,22 @@ def tool_list_files(directory: str, repo_root: Path) -> tuple[str, list[str]]:
     return "\n".join(parts), []
 
 
-def tool_find_callers(function_name: str, repo_root: Path, limit: int = 10, out_meta: list | None = None) -> tuple[str, list[str]]:
+def tool_find_callers(function_name: str, repo_root: Path, limit: int = 25, out_meta: list | None = None) -> tuple[str, list[str]]:
     """查找谁调用了该函数（grep 全仓库，定位到具体调用方函数）。
 
     out_meta 不为 None 时，把结构化调用点列表（name/file/line）extend 进去。
+    调用点超过 limit 时**显式声明截断**（此前静默截断为 10 处还显示"找到 10 处"，
+    Agent 会误以为那就是全部调用方——证据完整性问题）。
     """
     if not function_name:
         return "错误：find_callers 缺少 function_name 参数", []
-    callers = grep_callers(function_name, repo_root, limit=limit)
+    # 多查 1 个用于检测溢出
+    callers = grep_callers(function_name, repo_root, limit=limit + 1)
     if not callers:
         return f"没有找到调用 {function_name} 的地方", []
+    overflow = len(callers) > limit
+    if overflow:
+        callers = callers[:limit]
 
     # grep 词法分析定不了归属函数的调用点（name 为空），用 Neo4j 函数行号表补全
     anon_files = {c["file"] for c in callers if not c.get("name")}
@@ -160,7 +166,10 @@ def tool_find_callers(function_name: str, repo_root: Path, limit: int = 10, out_
 
     if out_meta is not None:
         out_meta.extend(callers)
-    lines = [f"找到 {len(callers)} 处对 {function_name} 的调用:"]
+    head = f"找到 {len(callers)} 处对 {function_name} 的调用"
+    if overflow:
+        head += f"（超过上限，仅显示前 {limit} 处；这不是全部调用方，可用 search_symbol 查完整提及）"
+    lines = [head + ":"]
     files = []
     for c in callers:
         loc = f"{c['file']}:{c['line']}"
@@ -178,16 +187,28 @@ def tool_find_callees(
     end_line: int,
     repo_root: Path,
     limit: int = 15,
+    out_meta: list | None = None,
 ) -> tuple[str, list[str]]:
-    """列出该函数体内调用了哪些函数（直接分析函数实现）。"""
+    """列出该函数体内调用了哪些函数（直接分析函数实现）。
+
+    out_meta 不为 None 时，把结构化 callee 列表（name/file）extend 进去。
+    """
     if not function_name or not file_path:
         return "错误：find_callees 需要 function_name 和 file_path 参数", []
     file_path = file_path.split(":")[0]
-    callees = grep_callees(function_name, file_path, start_line, end_line, repo_root, limit=limit)
+    callees = grep_callees(function_name, file_path, start_line, end_line, repo_root, limit=limit + 1)
     if not callees:
         return f"函数 {function_name} 体内没有发现函数调用", []
+    overflow = len(callees) > limit
+    if overflow:
+        callees = callees[:limit]
+    if out_meta is not None:
+        out_meta.extend(callees)
     names = [c["name"] for c in callees]
-    return f"函数 {function_name} 调用了: {', '.join(names)}", []
+    obs = f"函数 {function_name} 调用了: {', '.join(names)}"
+    if overflow:
+        obs += f"（超过 {limit} 个，仅显示前 {limit} 个；这不是全部，可用 read_lines 读完整函数体确认）"
+    return obs, []
 
 
 def tool_search_symbol(symbol_name: str, repo_root: Path, limit: int = 10) -> tuple[str, list[str]]:
@@ -234,6 +255,169 @@ def tool_search_symbol(symbol_name: str, repo_root: Path, limit: int = 10) -> tu
             seen.add(f)
             uniq.append(f)
     return "\n\n".join(sections), uniq
+
+
+def tool_search_codebase(
+    query: str,
+    repo_root: Path,
+    retriever=None,
+    chunks_by_id: dict | None = None,
+    limit: int = 8,
+) -> tuple[str, list[str], list[dict]]:
+    """区域级搜索：把自然语言意图翻译成结构化的区域报告。
+
+    返回 (observation, files, hits)。hits 是结构化候选 [{name, file_path, start_line, end_line, signature, score}]，
+    供调用方注入召回池/frontier。
+    组合现有组件：名称索引搜索 + 目录命中密度 + embedding 重查。
+    """
+    if not query or not query.strip():
+        return "错误：search_codebase 缺少 query 参数", [], []
+
+    import re
+    terms = [t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", query) if len(t) >= 3]
+    sections = []
+    files = []
+    hits: list[dict] = []
+
+    # 1. 名称索引搜索 + 目录密度
+    if chunks_by_id and terms:
+        dir_counts: dict[str, int] = {}
+        name_hits = []
+        for fid, ch in chunks_by_id.items():
+            meta = ch.get("meta") or {}
+            name = (meta.get("name") or "").lower()
+            fp = meta.get("file_path", "")
+            if not name or not fp:
+                continue
+            if any(t in name for t in terms):
+                parts = fp.split("/")
+                d = "/".join(parts[:3]) if len(parts) > 3 else "/".join(parts[:-1]) or parts[0]
+                dir_counts[d] = dir_counts.get(d, 0) + 1
+                name_hits.append(meta)
+        if dir_counts:
+            top_dirs = sorted(dir_counts.items(), key=lambda kv: -kv[1])[:5]
+            sections.append("命中目录：\n" + "\n".join(f"- {d}（{n} 个函数名命中）" for d, n in top_dirs))
+        # 名称命中按"精确度"排序：短名优先（更可能是核心符号）
+        name_hits.sort(key=lambda m: len(m.get("name") or ""))
+        for m in name_hits[:limit]:
+            hits.append({
+                "fid": f"{m['file_path']}:{m['name']}:{m.get('start_line', 0)}",
+                "name": m.get("name", ""), "file_path": m.get("file_path", ""),
+                "start_line": m.get("start_line", 0), "end_line": m.get("end_line", 0),
+                "signature": m.get("signature", ""), "score": 1.0,
+            })
+            files.append(m.get("file_path", ""))
+
+    # 2. embedding 重查（语义补充）
+    if retriever is not None:
+        try:
+            import numpy as _np
+            q_emb = retriever.encode_queries([query])[0]
+            for r in retriever.retrieve(_np.asarray([q_emb], dtype=_np.float32), top_k=limit):
+                md = r["metadata"]
+                fid = f"{md['file_path']}:{md['name']}:{md['start_line']}"
+                if any(h["fid"] == fid for h in hits):
+                    continue
+                hits.append({
+                    "fid": fid, "name": md.get("name", ""), "file_path": md.get("file_path", ""),
+                    "start_line": md.get("start_line", 0), "end_line": md.get("end_line", 0),
+                    "signature": md.get("signature", ""), "score": r.get("score", 0.0),
+                })
+                files.append(md.get("file_path", ""))
+        except Exception:
+            pass
+
+    if not hits:
+        return f"search_codebase('{query}') 没有找到相关区域", [], []
+
+    rep = "\n".join(
+        f"- {h['name']} @ {h['file_path']}:{h['start_line']}-{h['end_line']}"
+        + (f" — {h['signature'][:60]}" if h.get("signature") else "")
+        for h in hits[:limit]
+    )
+    sections.append(f"代表函数（{len(hits)} 个）：\n{rep}")
+    obs = f"search_codebase('{query}') 结果：\n\n" + "\n\n".join(sections)
+    return obs, sorted(set(f for f in files if f)), hits[: limit * 2]
+
+
+def tool_scan_directory(
+    directory: str,
+    repo_root: Path,
+    max_files: int = 12,
+    max_funcs_per_file: int = 15,
+    keywords: list | None = None,
+) -> tuple[str, list[str]]:
+    """目录粗筛：列出目录下代码文件及各自的函数名清单（只看名字/签名，不读实现）。
+
+    用于"这个目录大概率有相关文件，先扫一眼"的人类式探索：
+    数据来自 Neo4j tree-sitter 索引，成本远低于逐个 read_function。
+    keywords 非空时按关键词命中数排序再截断（036 案例：common/ 51 个文件按字母序截断，
+    gold 文件 ngram-map.cpp 被切掉）。
+    """
+    if not directory:
+        return "错误：scan_directory 缺少 directory 参数", []
+    directory = directory.rstrip("/")
+    abs_dir = (repo_root / directory).resolve()
+    try:
+        abs_dir.relative_to(repo_root.resolve())
+    except ValueError:
+        return f"错误：目录 {directory} 不在仓库内", []
+    if not abs_dir.is_dir():
+        return f"目录 {directory} 不存在", []
+    code_files = sorted(
+        p.name for p in abs_dir.iterdir() if p.is_file() and p.suffix in CODE_EXTS
+    )
+    if not code_files:
+        return f"目录 {directory} 下没有代码文件", []
+    # 子目录也列出来，方便继续下钻
+    subdirs = sorted(p.name + "/" for p in abs_dir.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+    # 一次性查该目录所有函数（Neo4j 索引，不读文件内容）
+    funcs_by_file: dict[str, list] = {}
+    try:
+        from src.core.neo4j_client import run_cypher
+        rows = run_cypher(
+            "MATCH (f:Function) WHERE f.file_path STARTS WITH $prefix "
+            "RETURN f.file_path AS fp, f.name AS name, f.start_line AS start "
+            "ORDER BY f.file_path, f.start_line",
+            {"prefix": directory + "/"},
+        )
+        for r in rows:
+            fp = r["fp"]
+            # 只要直接子文件，子目录的函数不归进来
+            if "/" in fp[len(directory) + 1:]:
+                continue
+            funcs_by_file.setdefault(fp, []).append(r["name"])
+    except Exception:
+        pass
+
+    # 关键词相关性排序：文件名/函数名命中关键词多的排前面（截断也先截无关的）
+    kws = [k.lower() for k in (keywords or []) if isinstance(k, str) and len(k) >= 3]
+    if kws:
+        def _rel(name: str) -> int:
+            fp = f"{directory}/{name}"
+            hay = name.lower() + " " + " ".join(funcs_by_file.get(fp, [])).lower()
+            return sum(1 for k in kws if k in hay)
+        code_files = sorted(code_files, key=lambda n: (-_rel(n), n))
+
+    lines = [f"目录 {directory} 粗筛（{len(code_files)} 个代码文件，只看函数名，未读实现）:"]
+    if subdirs:
+        lines.append("子目录: " + ", ".join(subdirs[:10]))
+    shown_files = code_files[:max_files]
+    for name in shown_files:
+        fp = f"{directory}/{name}"
+        funcs = funcs_by_file.get(fp, [])
+        if funcs:
+            listing = ", ".join(funcs[:max_funcs_per_file])
+            more = f" ... 还有 {len(funcs) - max_funcs_per_file} 个" if len(funcs) > max_funcs_per_file else ""
+            lines.append(f"■ {name}（{len(funcs)} 个函数）: {listing}{more}")
+        else:
+            lines.append(f"■ {name}（索引中无函数，可能是纯声明/宏文件）")
+    if len(code_files) > max_files:
+        rest = code_files[max_files:]
+        lines.append(f"... 还有 {len(rest)} 个文件未列出（{', '.join(rest[:8])} 等），可用 list_files 查看或指定子目录再扫")
+    lines.append("提示：对可疑文件用 list_functions 看完整函数清单，对可疑函数用 read_function 读实现。")
+    return "\n".join(lines), []
 
 
 def tool_expand_recall(recall_pool: list[dict], recall_shown: int, batch: int = 20) -> tuple[str, int]:
